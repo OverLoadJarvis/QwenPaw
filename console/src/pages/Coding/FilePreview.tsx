@@ -30,7 +30,7 @@ const IMAGE_EXTS = new Set([
   "bmp",
 ]);
 
-export type PreviewType = "image" | "pdf" | "markdown" | "csv" | "none";
+export type PreviewType = "image" | "pdf" | "markdown" | "csv" | "html" | "none";
 
 export function getPreviewType(filePath: string): PreviewType {
   const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
@@ -38,6 +38,7 @@ export function getPreviewType(filePath: string): PreviewType {
   if (ext === "pdf") return "pdf";
   if (ext === "md" || ext === "mdx") return "markdown";
   if (ext === "csv") return "csv";
+  if (ext === "html" || ext === "htm") return "html";
   return "none";
 }
 
@@ -150,6 +151,18 @@ function MarkdownPreview({ content }: { content: string }) {
   );
 }
 
+function HtmlPreview({ content }: { content: string }) {
+  return (
+    <iframe
+      className={styles.htmlIframe}
+      srcDoc={content}
+      title="HTML Preview"
+      sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
+      referrerPolicy="no-referrer"
+    />
+  );
+}
+
 const MAX_CSV_ROWS = 500;
 const MAX_CSV_COLS = 50;
 
@@ -214,5 +227,6 @@ export default function FilePreview({ filePath, content }: FilePreviewProps) {
   if (type === "pdf") return <PdfPreview filePath={filePath} />;
   if (type === "markdown") return <MarkdownPreview content={content} />;
   if (type === "csv") return <CsvPreview content={content} />;
+  if (type === "html") return <HtmlPreview content={content} />;
   return null;
 }
