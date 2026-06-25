@@ -528,7 +528,7 @@ class TestSendMedia:
     """P1: Media upload and sending."""
 
     async def test_extract_media_url_image(self, connected_channel):
-        from agentscope_runtime.engine.schemas.agent_schemas import ContentType
+        from qwenpaw.schemas import ContentType
 
         part = MagicMock()
         part.type = ContentType.IMAGE
@@ -538,7 +538,7 @@ class TestSendMedia:
         assert url == "https://example.com/photo.jpg"
 
     async def test_extract_media_url_file(self, connected_channel):
-        from agentscope_runtime.engine.schemas.agent_schemas import ContentType
+        from qwenpaw.schemas import ContentType
 
         part = MagicMock()
         part.type = ContentType.FILE
@@ -549,7 +549,7 @@ class TestSendMedia:
         assert url == "/tmp/report.pdf"
 
     async def test_extract_media_url_empty(self, connected_channel):
-        from agentscope_runtime.engine.schemas.agent_schemas import ContentType
+        from qwenpaw.schemas import ContentType
 
         part = MagicMock()
         part.type = ContentType.TEXT
@@ -558,7 +558,7 @@ class TestSendMedia:
 
     async def test_send_media_part_upload_success(self, connected_channel):
         """Media part should upload to COS and send via WebSocket."""
-        from agentscope_runtime.engine.schemas.agent_schemas import ContentType
+        from qwenpaw.schemas import ContentType
         from qwenpaw.app.channels.yuanbao.media import UploadResult
 
         part = MagicMock()
@@ -603,7 +603,7 @@ class TestSendMedia:
         connected_channel,
     ):
         """Failed upload should fall back to text link."""
-        from agentscope_runtime.engine.schemas.agent_schemas import ContentType
+        from qwenpaw.schemas import ContentType
 
         part = MagicMock()
         part.type = ContentType.IMAGE
@@ -940,7 +940,7 @@ class TestParseMsgBody:
         tmp_path,
     ):
         """TIMFileElem with audio suffix should yield AudioContent."""
-        from agentscope_runtime.engine.schemas.agent_schemas import (
+        from qwenpaw.schemas import (
             AudioContent,
         )
 
@@ -980,7 +980,7 @@ class TestParseMsgBody:
         tmp_path,
     ):
         """TIMFileElem with non-audio suffix should yield FileContent."""
-        from agentscope_runtime.engine.schemas.agent_schemas import (
+        from qwenpaw.schemas import (
             FileContent,
         )
 
@@ -1021,7 +1021,7 @@ class TestParseMsgBody:
         tmp_path,
     ):
         """Missing ``file_name`` should fall back to literal ``file``."""
-        from agentscope_runtime.engine.schemas.agent_schemas import (
+        from qwenpaw.schemas import (
             FileContent,
         )
 
@@ -1061,7 +1061,7 @@ class TestParseMsgBody:
         tmp_path,
     ):
         """Failed download should surface a TextContent placeholder."""
-        from agentscope_runtime.engine.schemas.agent_schemas import (
+        from qwenpaw.schemas import (
             TextContent,
         )
 
@@ -1112,13 +1112,13 @@ class TestHandleChatMessage:
         await connected_channel._handle_chat_message(inbound)
         assert connected_channel._enqueue.call_count == 1
 
-    async def test_ignores_self_message(self, connected_channel):
-        """Messages from bot itself should be ignored."""
+    async def test_bot_account_filtered_by_default(self, connected_channel):
+        """Bot accounts (bot_ prefix) should be ignored by default."""
         connected_channel._enqueue = MagicMock()
-        connected_channel._bot_id = "test_bot_id"
+        connected_channel.accept_bot_messages = False
         inbound = {
             "callback_command": "C2C.CallbackAfterSendMsg",
-            "from_account": "test_bot_id",
+            "from_account": "bot_test_bot_id",
             "sender_nickname": "Bot",
             "msg_id": "msg_self",
             "msg_body": [
@@ -1226,6 +1226,94 @@ class TestHandleChatMessage:
 
         session_file = tmp_path / "yuanbao_sessions.json"
         assert session_file.exists()
+
+    async def test_bot_message_filtered_by_default(self, connected_channel):
+        """Bot messages should be dropped when accept_bot_messages is False."""
+        import json
+
+        connected_channel._enqueue = MagicMock()
+        connected_channel.accept_bot_messages = False
+        inbound = {
+            "callback_command": "Group.CallbackAfterSendMsg",
+            "from_account": "szUvRH8s4ekettawNjDREmAG4W7h",
+            "sender_nickname": "元宝",
+            "group_code": "293831858",
+            "msg_id": "msg_bot_1",
+            "msg_body": [
+                {
+                    "msg_type": "TIMTextElem",
+                    "msg_content": {
+                        "text": "在呢～",
+                        "data": json.dumps(
+                            {
+                                "elem_type": 1013,
+                                "text": "在呢～",
+                                "user_id": "",
+                                "content": "",
+                            },
+                        ),
+                    },
+                },
+            ],
+        }
+        await connected_channel._handle_chat_message(inbound)
+        connected_channel._enqueue.assert_not_called()
+
+    async def test_bot_message_accepted_when_enabled(self, connected_channel):
+        """Bot messages pass through when accept_bot_messages is True."""
+        import json
+
+        connected_channel._enqueue = MagicMock()
+        connected_channel.accept_bot_messages = True
+        connected_channel.require_mention = False
+        inbound = {
+            "callback_command": "Group.CallbackAfterSendMsg",
+            "from_account": "szUvRH8s4ekettawNjDREmAG4W7h",
+            "sender_nickname": "元宝",
+            "group_code": "293831858",
+            "msg_id": "msg_bot_2",
+            "msg_body": [
+                {
+                    "msg_type": "TIMTextElem",
+                    "msg_content": {
+                        "text": "在呢～",
+                        "data": json.dumps(
+                            {
+                                "elem_type": 1013,
+                                "text": "在呢～",
+                                "user_id": "",
+                                "content": "",
+                            },
+                        ),
+                    },
+                },
+            ],
+        }
+        await connected_channel._handle_chat_message(inbound)
+        connected_channel._enqueue.assert_called_once()
+
+    async def test_custom_bot_filtered_by_from_account_prefix(
+        self,
+        connected_channel,
+    ):
+        """Custom bots with bot_ prefixed from_account should be filtered."""
+        connected_channel._enqueue = MagicMock()
+        connected_channel.accept_bot_messages = False
+        inbound = {
+            "callback_command": "Group.CallbackAfterSendMsg",
+            "from_account": "bot_3c71636ecdf9455783ab22d3bfa21fd2",
+            "sender_nickname": "灰的Bot3",
+            "group_code": "293831858",
+            "msg_id": "msg_custom_bot_1",
+            "msg_body": [
+                {
+                    "msg_type": "TIMTextElem",
+                    "msg_content": {"text": "收到！"},
+                },
+            ],
+        }
+        await connected_channel._handle_chat_message(inbound)
+        connected_channel._enqueue.assert_not_called()
 
 
 # =============================================================================
