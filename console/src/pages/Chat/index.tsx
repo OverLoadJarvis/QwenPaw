@@ -4,8 +4,9 @@ import {
   type IAgentScopeRuntimeWebUIRef,
 } from "@agentscope-ai/chat";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Modal, Result, Tooltip } from "antd";
+import { Alert, Button, Modal, Result, Tooltip } from "antd";
 import { useAppMessage } from "../../hooks/useAppMessage";
+import { useIsMobile } from "../../hooks/useIsMobile";
 import { ExclamationCircleOutlined, SettingOutlined } from "@ant-design/icons";
 import { SparkCopyLine, SparkAttachmentLine } from "@agentscope-ai/icons";
 import { usePlugins } from "../../plugins/PluginContext";
@@ -25,6 +26,8 @@ import ModelSelector from "./ModelSelector";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useAgentStore } from "../../stores/agentStore";
 import { useCodingMode } from "../../stores/codingModeStore";
+import { useLoopStore, fetchAvailableLoopSkills } from "../../stores/loopStore";
+import { LoopCommandChip } from "../../components/LoopInput";
 import { useChatAnywhereInput } from "@agentscope-ai/chat";
 import styles from "./index.module.less";
 import { IconButton } from "@agentscope-ai/design";
@@ -41,7 +44,6 @@ import ChatSessionInitializer from "./components/ChatSessionInitializer";
 import { ApprovalCard } from "../../components/ApprovalCard/ApprovalCard";
 import { commandsApi } from "../../api/modules/commands";
 import { useApprovalContext } from "../../contexts/ApprovalContext";
-import { planApi } from "../../api/modules/plan";
 import {
   useChatScalarSnapshot,
   useChatListSnapshot,
@@ -54,6 +56,14 @@ import {
 import { ChatScalar, ChatList } from "../../plugins/registry/slotKeys";
 import { HostRequestCard, HostResponseCard } from "./HostBubbles";
 import { withGenericFallback } from "../../components/Chat/ToolCards/adapters/v1Adapter";
+import { applyApprovalLevelToRequestBody } from "./approvalPayload";
+import {
+  createHeadlineFilterState,
+  filterHeadlineDelta,
+  flushHeadlineFilter,
+  type HeadlineStreamFilterState,
+  stripScrollHeadlineTextBlocks,
+} from "./headlineFilter";
 
 interface ApprovalMessageData {
   requestId: string;
@@ -61,12 +71,18 @@ interface ApprovalMessageData {
   rootSessionId?: string;
   agentId: string;
   toolName: string;
+  toolSource?: string;
   severity: string;
   findingsCount: number;
   findingsSummary: string;
   toolParams: Record<string, unknown>;
   createdAt: number;
   timeoutSeconds: number;
+  // Approval-scope choice (console-only). When isGeneralized is true the
+  // card offers Approve Pattern (similar) vs Approve Exact (exact).
+  isGeneralized?: boolean;
+  exactTarget?: string;
+  similarTarget?: string;
 }
 
 import WhisperSpeechButton, {
@@ -97,6 +113,9 @@ import { openExternalLink } from "../../utils/openExternalLink";
 import { getLastEditorCopy } from "../Coding/lastEditorCopy";
 import { useUploadLimitStore } from "../../stores/uploadLimitStore";
 import MessageQueuePanel from "./components/MessageQueuePanel";
+import ApprovalLevelToggle from "./components/ApprovalLevelToggle";
+import { useAgentRunningConfigApprovalLevel } from "../../hooks/useAgentRunningConfigApprovalLevel";
+import { type ToolExecutionLevel } from "../../utils/approval";
 import {
   useMessageQueueStore,
   type QueueItem,
@@ -534,6 +553,20 @@ function isSkillAvailableInConsole(skill: SkillSpec): boolean {
   if (!skill.enabled) return false;
   const channels = skill.channels?.length ? skill.channels : ["all"];
   return channels.includes("all") || channels.includes(DEFAULT_CHANNEL);
+}
+
+function sanitizeHeadlinePayload(
+  node: unknown,
+  streamState: HeadlineStreamFilterState,
+): void {
+  if (!node || typeof node !== "object") return;
+  if (!Array.isArray(node)) {
+    const record = node as Record<string, unknown>;
+    if (typeof record.delta === "string") {
+      record.delta = filterHeadlineDelta(record.delta, streamState);
+    }
+  }
+  stripScrollHeadlineTextBlocks(node);
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1106,7 @@ export default function ChatPage() {
   const { codingMode, initialized } = useCodingMode();
   const codingModeRef = useRef(codingMode);
   codingModeRef.current = codingMode;
+  const loopSelectedSkill = useLoopStore((s) => s.selectedSkill);
 
   // Wide mode toggle: expand chat content to full available width
   const [isWideMode, setIsWideMode] = useState(() => {
@@ -1129,7 +1163,11 @@ export default function ChatPage() {
   const extLists = useChatListSnapshot();
   const [refreshKey, setRefreshKey] = useState(0);
   const runtimeLoadingBridgeRef = useRef<RuntimeLoadingBridgeApi | null>(null);
-  const queueSessionId = chatId ?? "new";
+  const headlineStreamFilterRef = useRef<HeadlineStreamFilterState>(
+    createHeadlineFilterState(),
+  );
+  // Use sessionApi.lastActiveChatId when available to avoid "new" collision
+  const queueSessionId = chatId ?? sessionApi.lastActiveChatId ?? "new";
   const queueSessionIdRef = useRef(queueSessionId);
   queueSessionIdRef.current = queueSessionId;
   const messageQueue =
@@ -1138,6 +1176,9 @@ export default function ChatPage() {
   messageQueueRef.current = messageQueue;
   const autoSendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevQueueLenRef = useRef(messageQueue.length);
+
+  const sessionApprovalLevelRef = useRef<ToolExecutionLevel | null>(null);
+  const runningConfigApprovalLevel = useAgentRunningConfigApprovalLevel();
 
   // Track pending attachments for queue support
   const pendingFileListRef = useRef<
@@ -1186,16 +1227,42 @@ export default function ChatPage() {
   // determined by an exclusive Web Lock keyed by sessionId; when the owner
   // tab closes, another tab acquires the lock and becomes the owner.
   const [isOwner, setIsOwner] = useState(false);
+  const [ownershipResolved, setOwnershipResolved] = useState(false);
   const isOwnerRef = useRef(false);
   isOwnerRef.current = isOwner;
   useEffect(() => {
     setIsOwner(false);
+    setOwnershipResolved(false);
     const ctrl = new AbortController();
-    void holdOwnershipLock(queueSessionId, () => setIsOwner(true), ctrl.signal);
+    void holdOwnershipLock(
+      queueSessionId,
+      () => {
+        setIsOwner(true);
+        setOwnershipResolved(true);
+      },
+      ctrl.signal,
+    );
+    // If the lock callback never fires (e.g. another tab holds it), resolve
+    // after a short delay so the non-owner Alert appears without flashing.
+    const fallbackTimer = setTimeout(() => {
+      setOwnershipResolved(true);
+    }, 300);
     return () => {
       ctrl.abort();
+      clearTimeout(fallbackTimer);
     };
   }, [queueSessionId]);
+
+  useEffect(() => {
+    void fetchAvailableLoopSkills();
+  }, []);
+
+  // Whether this tab is confirmed to be a non-owner (queue-only) tab.
+  // Stays false until ownership check completes, preventing a flash of
+  // the "other tab is owner" banner on every session switch.
+  const isQueueOnlyTab = ownershipResolved && !isOwner;
+  const hasQueueItems = messageQueue.length > 0;
+  const showSenderBeforeUI = isQueueOnlyTab || hasQueueItems;
 
   const scheduleNextSend = useCallback(() => {
     if (autoSendTimerRef.current) clearTimeout(autoSendTimerRef.current);
@@ -1282,9 +1349,13 @@ export default function ChatPage() {
   const [approvalRequests, setApprovalRequests] = useState<
     Map<string, ApprovalMessageData>
   >(new Map());
-  const [planEnabled, setPlanEnabled] = useState(false);
   const { mode: sidebarMode } = useSidebarModeStore();
   const isFullMode = sidebarMode === "full";
+
+  // On mobile viewports the right-side history panel should always be
+  // available regardless of the sidebar mode setting.
+  const isMobile = useIsMobile();
+  const effectiveIsFullMode = isFullMode || isMobile;
 
   // Right-side history panel state
   const [historyPanelOpen, setHistoryPanelOpen] = useState(() => {
@@ -1314,19 +1385,6 @@ export default function ChatPage() {
     () => chatSkills.filter(isSkillAvailableInConsole),
     [chatSkills],
   );
-
-  useEffect(() => {
-    let cancelled = false;
-    planApi
-      .getPlanConfig()
-      .then((cfg) => {
-        if (!cancelled) setPlanEnabled(cfg.enabled);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedAgent]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1433,12 +1491,16 @@ export default function ChatPage() {
         rootSessionId: approval.root_session_id,
         agentId: approval.agent_id,
         toolName: approval.tool_name,
+        toolSource: approval.tool_source,
         severity: approval.severity,
         findingsCount: approval.findings_count,
         findingsSummary: approval.findings_summary,
         toolParams: approval.tool_params,
         createdAt: approval.created_at,
         timeoutSeconds: approval.timeout_seconds,
+        isGeneralized: approval.is_generalized,
+        exactTarget: approval.exact_target,
+        similarTarget: approval.similar_target,
       });
     }
 
@@ -1446,11 +1508,11 @@ export default function ChatPage() {
   }, [approvals, chatId]);
 
   const handleApprove = useCallback(
-    async (requestId: string) => {
+    async (requestId: string, scope?: "exact" | "similar") => {
       const request = approvalRequests.get(requestId);
       if (!request) return;
 
-      const rootSessionId = window.currentSessionId || chatId || "";
+      const rootSessionId = request.rootSessionId || request.sessionId;
 
       try {
         const cardElement = document.querySelector(
@@ -1464,6 +1526,8 @@ export default function ChatPage() {
           "approve",
           requestId,
           rootSessionId,
+          undefined,
+          scope,
         );
         setApprovals((prev) =>
           prev.filter((item) => item.request_id !== requestId),
@@ -1492,7 +1556,7 @@ export default function ChatPage() {
       if (!request) return;
 
       // Use currentSessionId (root session) instead of request.sessionId (sub-agent session)
-      const rootSessionId = window.currentSessionId || chatId || "";
+      const rootSessionId = request.rootSessionId || request.sessionId;
 
       try {
         // Add exit animation class
@@ -1593,6 +1657,76 @@ export default function ChatPage() {
   useMessageHistoryNavigation(chatRef, isChatActive, isComposingRef);
   useChatInputDraft(isChatActive, selectedAgent);
   useChatPasteFromEditor();
+
+  // ── Loop chip intercept: detect __loop__ prefix from suggestion selection ──
+  useEffect(() => {
+    let rafId = 0;
+    let lastChecked = "";
+
+    const checkForLoopPrefix = () => {
+      const textarea = document
+        .querySelector('[class*="sender"]')
+        ?.querySelector("textarea") as HTMLTextAreaElement | null;
+      if (!textarea) return;
+      const val = textarea.value;
+      if (val === lastChecked) return;
+      lastChecked = val;
+      const loopMatch = val.match(/^\/?__loop__(\S+)/);
+      if (loopMatch) {
+        const skillName = loopMatch[1].trim();
+        const skills = useLoopStore.getState().availableSkills;
+        const skill = skills.find((s) => s.name === skillName) ?? {
+          name: skillName,
+          description: skillName,
+        };
+        useLoopStore.getState().setSelectedSkill(skill);
+        setTextareaValue(textarea, "");
+        lastChecked = "";
+      }
+    };
+
+    const onInput = () => checkForLoopPrefix();
+
+    const poll = () => {
+      checkForLoopPrefix();
+      rafId = requestAnimationFrame(poll);
+    };
+    rafId = requestAnimationFrame(poll);
+
+    document.addEventListener("input", onInput, true);
+    return () => {
+      cancelAnimationFrame(rafId);
+      document.removeEventListener("input", onInput, true);
+    };
+  }, []);
+
+  // ── Loop chip backspace: highlight on first backspace, delete on second ──
+  useEffect(() => {
+    const handleChipBackspace = (e: KeyboardEvent) => {
+      if (!isChatActive()) return;
+      if (e.key !== "Backspace") {
+        if (useLoopStore.getState().chipHighlighted) {
+          useLoopStore.getState().setChipHighlighted(false);
+        }
+        return;
+      }
+      const target = e.target as HTMLElement;
+      if (target?.tagName !== "TEXTAREA") return;
+      const textarea = target as HTMLTextAreaElement;
+      if (textarea.selectionStart !== 0 || textarea.value.length > 0) return;
+      if (!useLoopStore.getState().selectedSkill) return;
+
+      e.preventDefault();
+      if (useLoopStore.getState().chipHighlighted) {
+        useLoopStore.getState().setSelectedSkill(null);
+      } else {
+        useLoopStore.getState().setChipHighlighted(true);
+      }
+    };
+    document.addEventListener("keydown", handleChipBackspace, true);
+    return () =>
+      document.removeEventListener("keydown", handleChipBackspace, true);
+  }, [isChatActive]);
 
   // ── Message Queue ───────────────────────────────────────────────────────
 
@@ -1701,9 +1835,6 @@ export default function ChatPage() {
       if (!val) return;
       e.preventDefault();
       e.stopPropagation();
-      if (!chatId) {
-        return;
-      }
       const currentQ = useMessageQueueStore.getState().getQueue(queueSessionId);
       if (currentQ.length >= MAX_QUEUE_SIZE) {
         message.warning(t("chat.queue.queueFull", { max: MAX_QUEUE_SIZE }));
@@ -1915,10 +2046,10 @@ export default function ChatPage() {
 
     const buildCurrentBasePath = () => buildBasePath(getCurrentRouteMode());
 
-    sessionApi.onSessionIdResolved = (_tempId, realId) => {
+    sessionApi.onSessionIdResolved = (tempId, realId) => {
       if (!isChatActiveRef.current) return;
       try {
-        useMessageQueueStore.getState().migrateQueue("new", realId);
+        useMessageQueueStore.getState().migrateQueue(tempId, realId);
       } catch {
         // ignore migration errors
       }
@@ -1932,16 +2063,18 @@ export default function ChatPage() {
     };
 
     sessionApi.onSessionRemoved = (removedId) => {
-      if (!isChatActiveRef.current) return;
-      // Clear URL when current session is removed
-      // Check if removed session matches current session (by realId or sessionId)
-      const currentRealId = sessionApi.getRealIdForSession(
-        chatIdRef.current || "",
-      );
-      if (chatIdRef.current === removedId || currentRealId === removedId) {
-        lastSessionIdRef.current = null;
-        navigateRef.current(buildCurrentBasePath(), { replace: true });
+      // Clean up the queue and abort any in-flight background send for the
+      // removed session so stale items don't linger in storage or get sent
+      // after the conversation is deleted. Navigation to a fresh chat is
+      // owned by the delete handlers (via the "qwenpaw:sidebar-new-chat"
+      // event), so this callback stays focused on resource cleanup and can
+      // run regardless of which session is currently active.
+      try {
+        useMessageQueueStore.getState().clear(removedId);
+      } catch {
+        // ignore
       }
+      stopBackgroundQueue(removedId);
     };
 
     sessionApi.onSessionSelected = (
@@ -2155,6 +2288,12 @@ export default function ChatPage() {
         }
       }
 
+      applyApprovalLevelToRequestBody(
+        requestBody,
+        sessionApprovalLevelRef.current,
+        runningConfigApprovalLevel,
+      );
+
       const backendChatId =
         sessionApi.getRealIdForSession(String(requestBody.session_id || "")) ??
         chatIdRef.current ??
@@ -2181,6 +2320,8 @@ export default function ChatPage() {
         }
       }
 
+      headlineStreamFilterRef.current = createHeadlineFilterState();
+
       const response = await fetch(getApiUrl("/console/chat"), {
         method: "POST",
         headers,
@@ -2195,7 +2336,7 @@ export default function ChatPage() {
 
       return wrapChatResponseUsageStream(response, chatRef);
     },
-    [extLists, selectedAgent],
+    [extLists, selectedAgent, runningConfigApprovalLevel],
   );
 
   const handleFileUpload = useCallback(
@@ -2257,6 +2398,11 @@ export default function ChatPage() {
     const i18nConfig = getDefaultConfig(t);
     const commandSuggestions: CommandSuggestion[] = [
       {
+        command: "/new",
+        value: "new",
+        description: "",
+      },
+      {
         command: "/clear",
         value: "clear",
         description: t("chat.commands.clear.description"),
@@ -2268,7 +2414,7 @@ export default function ChatPage() {
       },
       {
         command: "/mission",
-        value: "mission",
+        value: "__loop__mission",
         description: t("chat.commands.mission.description"),
       },
       {
@@ -2276,24 +2422,39 @@ export default function ChatPage() {
         value: "skills",
         description: t("chat.commands.skills.description"),
       },
+      {
+        command: "/goal",
+        value: "__loop__goal",
+        description: t("chat.commands.goal.description"),
+      },
     ];
-    if (planEnabled) {
-      commandSuggestions.push({
-        command: "/plan",
-        value: "plan ",
-        description: t("chat.commands.plan.description"),
-      });
-    }
     const reservedCommands = new Set(
-      commandSuggestions.map((item) => item.value.trim()),
+      commandSuggestions.map((item) => item.command.slice(1).trim()),
+    );
+    const loopSkillNames = new Set(
+      useLoopStore.getState().availableSkills.map((s) => s.name),
     );
     const skillSuggestions: CommandSuggestion[] = consoleSkills
       .filter((skill) => !reservedCommands.has(skill.name))
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((skill) => ({
         command: `/${skill.name}`,
-        value: skill.name,
+        value: loopSkillNames.has(skill.name)
+          ? `__loop__${skill.name}`
+          : skill.name,
         description: "",
+      }));
+    const loopOnlySuggestions: CommandSuggestion[] = useLoopStore
+      .getState()
+      .availableSkills.filter(
+        (s) =>
+          !reservedCommands.has(s.name) &&
+          !consoleSkills.some((cs) => cs.name === s.name),
+      )
+      .map((s) => ({
+        command: `/${s.name}`,
+        value: `__loop__${s.name}`,
+        description: s.description,
       }));
     const handleBeforeSubmit = async () => {
       if (isComposingRef.current) return false;
@@ -2307,9 +2468,6 @@ export default function ChatPage() {
           ?.querySelector("textarea") as HTMLTextAreaElement | null;
         const val = textarea?.value.trim() ?? "";
         if (!val) return false;
-        if (!chatId) {
-          return false;
-        }
         const currentQ = useMessageQueueStore
           .getState()
           .getQueue(queueSessionId);
@@ -2317,8 +2475,10 @@ export default function ChatPage() {
           message.warning(t("chat.queue.queueFull", { max: MAX_QUEUE_SIZE }));
           return false;
         }
+        const loopSkill = useLoopStore.getState().selectedSkill;
+        const queueText = loopSkill ? `/${loopSkill.name} ${val}` : val;
         useMessageQueueStore.getState().enqueue(queueSessionId, {
-          text: val,
+          text: queueText,
           attachments:
             pendingFileListRef.current.length > 0
               ? pendingFileListRef.current.map((f) => ({
@@ -2331,6 +2491,9 @@ export default function ChatPage() {
           userId: window.currentUserId || DEFAULT_USER_ID,
           channel: window.currentChannel || DEFAULT_CHANNEL,
         });
+        if (loopSkill) {
+          useLoopStore.getState().setSelectedSkill(null);
+        }
         pendingFileListRef.current = [];
         if (textarea) setTextareaValue(textarea, "");
         // Clear sender attachment preview (deferred to next tick)
@@ -2343,6 +2506,23 @@ export default function ChatPage() {
       draftSuppressed = true;
       // Clear pending attachments when sending directly (not through queue)
       pendingFileListRef.current = [];
+
+      // Inject loop command prefix when a chip is active
+      const loopState = useLoopStore.getState();
+      if (loopState.selectedSkill) {
+        const textarea = document
+          .querySelector('[class*="sender"]')
+          ?.querySelector("textarea") as HTMLTextAreaElement | null;
+        if (textarea) {
+          const prefix = `/${loopState.selectedSkill.name} `;
+          const current = textarea.value;
+          if (!current.startsWith(prefix)) {
+            setTextareaValue(textarea, `${prefix}${current}`);
+          }
+        }
+        loopState.setSelectedSkill(null);
+      }
+
       return true;
     };
 
@@ -2504,12 +2684,18 @@ export default function ChatPage() {
       );
     }
 
-    const baseSuggestions = [...commandSuggestions, ...skillSuggestions].map(
-      (item) => ({
-        label: renderSuggestionLabel(item.command, item.description),
-        value: item.value,
-      }),
-    );
+    const baseSuggestions = [
+      ...commandSuggestions,
+      ...loopOnlySuggestions,
+      ...skillSuggestions,
+    ].map((item) => ({
+      label: renderSuggestionLabel(item.command, item.description),
+      value: item.value,
+    }));
+    const userMessageAnchorsConfig = {
+      ...defaultConfig.theme.bubbleList.userMessageAnchors,
+      variant: "navigator" as const,
+    };
 
     // leftHeader: whole-section render wins, otherwise partial merge {logo, title}.
     const mergedLeftHeader: any =
@@ -2534,6 +2720,10 @@ export default function ChatPage() {
         ...defaultConfig.theme,
         darkMode: isDark,
         ...(extColorPrimary ? { colorPrimary: extColorPrimary } : {}),
+        bubbleList: {
+          ...defaultConfig.theme.bubbleList,
+          userMessageAnchors: userMessageAnchorsConfig,
+        },
         leftHeader: mergedLeftHeader,
         rightHeader: (
           <>
@@ -2546,9 +2736,10 @@ export default function ChatPage() {
             <span style={{ flex: 1 }} />
             <ModelSelector />
             <ChatActionGroup
-              planEnabled={planEnabled}
-              onToggleHistory={isFullMode ? toggleHistoryPanel : undefined}
-              historyOpen={isFullMode ? historyPanelOpen : false}
+              onToggleHistory={
+                effectiveIsFullMode ? toggleHistoryPanel : undefined
+              }
+              historyOpen={effectiveIsFullMode ? historyPanelOpen : false}
               isWideMode={isWideMode}
               onToggleWideMode={toggleWideMode}
             />
@@ -2572,38 +2763,66 @@ export default function ChatPage() {
         ...(i18nConfig as any)?.sender,
         beforeSubmit: handleBeforeSubmit,
         allowSpeech: whisperChecked && !whisperEnabled,
-        beforeUI:
-          !isOwner || messageQueue.length > 0 ? (
-            <>
-              {null}
-              {messageQueue.length > 0 ? (
-                <MessageQueuePanel
-                  items={messageQueue}
-                  runState={runState}
-                  onRemove={handleQueueRemove}
-                  onEdit={handleQueueEdit}
-                  onReorder={handleQueueReorder}
-                  onInterruptAndSend={handleQueueInterruptAndSend}
-                  onClear={handleQueueClear}
-                  onPauseResume={handleQueuePauseResume}
-                  onRetry={handleQueueRetry}
-                  onSkip={handleQueueSkip}
+        beforeUI: showSenderBeforeUI ? (
+          <>
+            {isQueueOnlyTab && (
+              <Alert
+                type="info"
+                showIcon
+                banner
+                message={t("chat.queue.otherTabOwner")}
+              />
+            )}
+            {hasQueueItems ? (
+              <MessageQueuePanel
+                items={messageQueue}
+                runState={runState}
+                onRemove={handleQueueRemove}
+                onEdit={handleQueueEdit}
+                onReorder={handleQueueReorder}
+                onInterruptAndSend={handleQueueInterruptAndSend}
+                onClear={handleQueueClear}
+                onPauseResume={handleQueuePauseResume}
+                onRetry={handleQueueRetry}
+                onSkip={handleQueueSkip}
+              />
+            ) : null}
+          </>
+        ) : undefined,
+        prefix: (
+          <>
+            {whisperEnabled ? (
+              <WhisperSpeechButton
+                ref={whisperSpeechRef}
+                onTranscription={handleWhisperTranscription}
+              />
+            ) : null}
+            <LoopCommandChip />
+            {loopSelectedSkill ? (
+              <Tooltip title={t("loop.gotoSettings", "Agent Loop Settings")}>
+                <SettingOutlined
+                  style={{
+                    fontSize: 14,
+                    cursor: "pointer",
+                    color: "var(--text-secondary, rgba(0,0,0,0.45))",
+                    padding: "4px 6px",
+                  }}
+                  onClick={() => navigate("/agent-config?tab=agentLoop")}
                 />
-              ) : null}
-            </>
-          ) : undefined,
-        prefix:
-          whisperEnabled || pluginSenderPrefix.length > 0 ? (
-            <>
-              {whisperEnabled ? (
-                <WhisperSpeechButton
-                  ref={whisperSpeechRef}
-                  onTranscription={handleWhisperTranscription}
-                />
-              ) : null}
-              {pluginSenderPrefix}
-            </>
-          ) : undefined,
+              </Tooltip>
+            ) : null}
+            {pluginSenderPrefix}
+          </>
+        ),
+        actionAffix: (
+          <ApprovalLevelToggle
+            sessionId={queueSessionId}
+            runningConfigApprovalLevel={runningConfigApprovalLevel}
+            onChange={(sessionOverride) => {
+              sessionApprovalLevelRef.current = sessionOverride;
+            }}
+          />
+        ),
         attachments: {
           multiple: true,
           trigger: function (props: any) {
@@ -2631,6 +2850,15 @@ export default function ChatPage() {
           },
           customRequest: handleFileUpload,
         },
+        longTextUpload: {
+          ...((i18nConfig as any)?.sender?.longTextUpload ?? {}),
+          customRequest: handleFileUpload,
+          prompt: () =>
+            t(
+              "chat.longTextUploadPrompt",
+              "Please read the uploaded prompt file and answer it.",
+            ),
+        },
         placeholder: extPlaceholder ?? t("chat.inputPlaceholder"),
         ...(extDisclaimer !== undefined ? { disclaimer: extDisclaimer } : {}),
         suggestions: [...baseSuggestions, ...pluginSuggestions],
@@ -2645,9 +2873,18 @@ export default function ChatPage() {
         fetch: customFetch,
         responseParser: (chunk: string) => {
           const payload = JSON.parse(chunk) as Record<string, unknown>;
+          sanitizeHeadlinePayload(payload, headlineStreamFilterRef.current);
 
           if (payloadCompletesResponse(payload)) {
+            const trailing = flushHeadlineFilter(
+              headlineStreamFilterRef.current,
+            );
+            headlineStreamFilterRef.current = createHeadlineFilterState();
             const output = payload.output;
+            // A completed response normally carries canonical full output,
+            // which already contains any ordinary trailing prefix. Use the
+            // flushed delta only when that canonical output is absent, so it
+            // is neither lost nor duplicated.
             if (!output || (Array.isArray(output) && output.length === 0)) {
               const errorMsg =
                 (payload.error as any)?.message || t("chat.emptyOutputError");
@@ -2655,7 +2892,7 @@ export default function ChatPage() {
                 {
                   type: "message",
                   role: "assistant",
-                  content: [{ type: "text", text: errorMsg }],
+                  content: [{ type: "text", text: trailing || errorMsg }],
                 },
               ];
             }
@@ -2702,6 +2939,7 @@ export default function ChatPage() {
           };
 
           const reconnectIdentity = sessionApi.getSessionIdentity();
+          headlineStreamFilterRef.current = createHeadlineFilterState();
           const response = await fetch(getApiUrl("/console/chat"), {
             method: "POST",
             headers,
@@ -2749,11 +2987,13 @@ export default function ChatPage() {
             render: ({
               data,
             }: {
-              data: { data?: { created_at?: number } };
+              data: { data?: { created_at?: number; completed_at?: number } };
             }) => {
               return (
                 <span style={timestampStyle}>
-                  {formatMessageTime(data?.data?.created_at ?? 0)}
+                  {formatMessageTime(
+                    data?.data?.completed_at ?? data?.data?.created_at ?? 0,
+                  )}
                 </span>
               );
             },
@@ -2761,6 +3001,7 @@ export default function ChatPage() {
           ...pluginActions,
         ],
         replace: true,
+        right: false,
       },
       requestActions: {
         list: [
@@ -2803,9 +3044,10 @@ export default function ChatPage() {
     extScalar,
     extLists,
     scheduleHistoryClear,
-    planEnabled,
     consoleSkills,
     selectedAgent,
+    runningConfigApprovalLevel,
+    queueSessionId,
     onFileCardClick,
     whisperChecked,
     whisperEnabled,
@@ -2905,6 +3147,7 @@ export default function ChatPage() {
               requestId={request.requestId}
               agentId={request.agentId}
               toolName={request.toolName}
+              toolSource={request.toolSource}
               severity={request.severity}
               findingsCount={request.findingsCount}
               findingsSummary={request.findingsSummary}
@@ -2913,7 +3156,10 @@ export default function ChatPage() {
               timeoutSeconds={request.timeoutSeconds}
               sessionId={request.sessionId}
               rootSessionId={request.rootSessionId}
-              onApprove={handleApprove}
+              isGeneralized={request.isGeneralized}
+              exactTarget={request.exactTarget}
+              similarTarget={request.similarTarget}
+              onApprove={(reqId, scope) => handleApprove(reqId, scope)}
               onDeny={handleDeny}
               onCancel={() => {
                 const sessionId =
@@ -3001,19 +3247,29 @@ export default function ChatPage() {
       {/* End of main chat area */}
 
       {/* Right-side history panel (full mode only) */}
-      {isFullMode && historyPanelOpen && (
+      {effectiveIsFullMode && historyPanelOpen && (
         <>
-          <div
-            className={styles.historyPanelMask}
-            onClick={toggleHistoryPanel}
-          />
-          <div className={styles.historyPanel}>
+          {isMobile ? (
             <ChatSessionDrawer
               open={historyPanelOpen}
               onClose={toggleHistoryPanel}
-              embedded
+              embedded={false}
             />
-          </div>
+          ) : (
+            <>
+              <div
+                className={styles.historyPanelMask}
+                onClick={toggleHistoryPanel}
+              />
+              <div className={styles.historyPanel}>
+                <ChatSessionDrawer
+                  open={historyPanelOpen}
+                  onClose={toggleHistoryPanel}
+                  embedded
+                />
+              </div>
+            </>
+          )}
         </>
       )}
     </div>

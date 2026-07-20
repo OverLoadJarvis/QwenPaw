@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class ContextVarsSetupHook(LifecycleHook):
     """Inject per-request ContextVars before agent execution."""
 
-    phase = Phase.PRE_EXECUTE
+    phase = Phase.PRE_DISPATCH
     name = "contextvars_setup"
     priority = 10
 
@@ -33,8 +33,10 @@ class ContextVarsSetupHook(LifecycleHook):
         )
         from ...app.agent_context import (
             set_current_agent_id,
+            set_current_channel,
             set_current_root_session_id,
             set_current_session_id as _set_app_session_id,
+            set_current_user_id,
         )
 
         if ctx.workspace_dir is not None:
@@ -46,6 +48,8 @@ class ContextVarsSetupHook(LifecycleHook):
         set_current_root_session_id(
             ctx.root_session_id or ctx.session_id or "",
         )
+        set_current_user_id(ctx.request.user_id)
+        set_current_channel(getattr(ctx.request, "channel", None))
 
         try:
             from ...config.config import load_agent_config

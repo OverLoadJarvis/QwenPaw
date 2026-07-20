@@ -173,6 +173,7 @@ class FakeAgent(Agent):
                 tool_call=ToolCallUpdate(
                     tool_call_id="t1",
                     title="dangerous_tool",
+                    raw_input={"command": "rm -rf /tmp/nope"},
                 ),
             )
             chosen = getattr(
@@ -193,6 +194,7 @@ class FakeAgent(Agent):
                 "read_file",
                 kind="read",
                 status="in_progress",
+                raw_input={"path": "README.md"},
             ),
         )
         await self._conn.session_update(

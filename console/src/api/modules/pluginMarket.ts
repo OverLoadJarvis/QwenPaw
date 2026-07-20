@@ -17,6 +17,10 @@ export interface MarketPluginEntry {
   view_count: number;
   details_url: string | null;
   locales: Record<string, MarketPluginLocale>;
+  /** QwenPaw major-version compatibility labels, e.g. `["1.x"]`. */
+  qwenpaw_compat_labels?: string[];
+  /** Whether this plugin is featured (1 = featured, 0 or undefined = not). */
+  is_featured?: 0 | 1;
 }
 
 interface MarketPluginListResponse {

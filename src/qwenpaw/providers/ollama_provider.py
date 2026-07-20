@@ -7,6 +7,7 @@ from typing import Any
 from agentscope.model import ChatModelBase
 from openai import AsyncOpenAI
 
+from qwenpaw.providers.capping_formatter import _CappingOpenAIFormatter
 from qwenpaw.providers.openai_provider import OpenAIProvider
 
 
@@ -63,6 +64,14 @@ class OllamaProvider(OpenAIProvider):
             return True, ""
         return False, f"Model '{model_id}' not found"
 
+    def _context_catalog_enabled(self) -> bool:
+        """Ollama serves models locally: the family's cloud window does not
+        apply (a local ``qwen3-coder:30b`` truncates at ``num_ctx``, not at
+        262k). Skip the static catalog; an explicit per-model
+        ``max_input_length`` still wins, everything else gets the 128k
+        default."""
+        return False
+
     def get_chat_model_instance(self, model_id: str) -> ChatModelBase:
         from agentscope.credential._openai import OpenAICredential
         from agentscope.model import OpenAIChatModel
@@ -88,4 +97,8 @@ class OllamaProvider(OpenAIProvider):
             default_headers=self._build_default_headers() or None,
             extra_generate_kwargs=gen_kwargs or None,
             context_size=self._get_context_size(model_id),
+            formatter=_CappingOpenAIFormatter(
+                max_bytes=self.max_inline_media_bytes,
+                relay_reasoning_content=self._get_relay_reasoning(model_id),
+            ),
         )

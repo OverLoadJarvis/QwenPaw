@@ -12,6 +12,15 @@ from typing import Any
 
 from qwenpaw.config.config import AgentProfileConfig, EmbeddingModelConfig
 
+# Keep in sync with ReMeLightMemoryCard.tsx OPENAI_COMPAT_EMBEDDING_BACKENDS.
+_OPENAI_COMPAT_EMBEDDING_BACKENDS = {
+    "openai",
+    "dashscope",
+    "dashscope_multimodal",
+}
+
+_MAX_FILE_BYTES = 10 * 1024 * 1024
+
 
 def build_reme_app_config(
     *,
@@ -21,7 +30,7 @@ def build_reme_app_config(
 ) -> dict[str, Any]:
     """Build ReMe ``Application`` kwargs for embedded QwenPaw usage."""
     reme_config = agent_config.running.reme_light_memory_config
-    cfg = _base_config(reme_config.enable_search_raw_log)
+    cfg = _base_config()
     _apply_embedding_config(
         cfg,
         reme_config.embedding_model_config,
@@ -31,28 +40,34 @@ def build_reme_app_config(
             "workspace_dir": working_dir,
             "metadata_dir": reme_config.metadata_dir,
             "session_dir": reme_config.session_dir,
+            "mem_session_dir": reme_config.mem_session_dir,
             "resource_dir": reme_config.resource_dir,
             "daily_dir": reme_config.daily_dir,
             "digest_dir": reme_config.digest_dir,
             "language": agent_config.language,
             "timezone": user_timezone or "Asia/Shanghai",
             "enable_logo": False,
-            "log_to_console": False,
+            "log_to_console": True,
         },
     )
 
     return cfg
 
 
-def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
+def _base_config() -> dict[str, Any]:
     """Return the ReMe config shape used by QwenPaw."""
-    watch_dirs, watch_suffixes = _index_watch_rules(enable_search_raw_log)
+    # Raw conversation-log lookup belongs to the scroll context strategy's
+    # recall_history(op="search") tool. Keep ReMe search scoped to distilled
+    # memory Markdown so the two systems do not duplicate indexes or duties.
+    watch_dirs = ["daily_dir", "digest_dir"]
+    watch_suffixes = ["md"]
 
     return {
         "service": {"backend": "http"},
         "jobs": {
             "index_update_loop": {
                 "backend": "background",
+                "max_file_bytes": _MAX_FILE_BYTES,
                 "watch_dirs": watch_dirs,
                 "watch_suffixes": watch_suffixes,
                 "steps": [
@@ -70,51 +85,62 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
                     },
                 ],
             },
-            # "resource_watch_loop": {
-            #     "backend": "background",
-            #     "watch_dirs": ["resource_dir"],
-            #     "watch_suffixes": [
-            #         "md",
-            #         "txt",
-            #         "json",
-            #         "jsonl",
-            #         "csv",
-            #         "yaml",
-            #         "html",
-            #     ],
-            #     "steps": [
-            #         {
-            #             "backend": "init_changes_step",
-            #             "monitor_type": "file_catalog",
-            #             "monitor_name": "resource",
-            #             "dispatch_steps": [
-            #                 {
-            #                     "backend": "update_catalog_step",
-            #                     "file_catalog": "resource",
-            #                 },
-            #                 {"backend": "auto_resource_step"},
-            #             ],
-            #         },
-            #         {
-            #             "backend": "watch_changes_step",
-            #             "dispatch_steps": [
-            #                 {
-            #                     "backend": "update_catalog_step",
-            #                     "file_catalog": "resource",
-            #                 },
-            #                 {"backend": "auto_resource_step"},
-            #             ],
-            #         },
-            #     ],
-            # },
+            "resource_watch_loop": {
+                "backend": "background",
+                "max_file_bytes": _MAX_FILE_BYTES,
+                "watch_dirs": ["resource_dir"],
+                "watch_suffixes": [
+                    "md",
+                    "txt",
+                    "json",
+                    "jsonl",
+                    "csv",
+                    "yaml",
+                    "html",
+                ],
+                "steps": [
+                    {
+                        "backend": "init_changes_step",
+                        "monitor_type": "file_catalog",
+                        "monitor_name": "resource",
+                        "dispatch_steps": [
+                            {
+                                "backend": "update_catalog_step",
+                                "file_catalog": "resource",
+                            },
+                            {"backend": "auto_resource_step"},
+                        ],
+                    },
+                    {
+                        "backend": "watch_changes_step",
+                        "dispatch_steps": [
+                            {
+                                "backend": "update_catalog_step",
+                                "file_catalog": "resource",
+                            },
+                            {"backend": "auto_resource_step"},
+                        ],
+                    },
+                ],
+            },
             "version": {
                 "backend": "base",
                 "description": "return reme package version",
                 "parameters": {"type": "object", "properties": {}},
                 "steps": [{"backend": "version_step"}],
             },
+            "status": {
+                "backend": "base",
+                "description": (
+                    "report memory estimates for stateful data components "
+                    "and process RSS"
+                ),
+                "parameters": {"type": "object", "properties": {}},
+                "steps": [{"backend": "status_step"}],
+            },
             "reindex": {
                 "backend": "base",
+                "max_file_bytes": _MAX_FILE_BYTES,
                 "description": (
                     "wipe the file store and rebuild it from the existing "
                     "files"
@@ -135,7 +161,7 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
             "search": {
                 "backend": "base",
                 "description": (
-                    "Hybrid vault search (vector + BM25, RRF-fused)."
+                    "Hybrid workspace search (vector + BM25, RRF-fused)."
                 ),
                 "parameters": {
                     "type": "object",
@@ -169,7 +195,11 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
             },
             "node_search": {
                 "backend": "base",
-                "description": "Digest node recall.",
+                "description": (
+                    "Digest node recall — given a candidate abstraction's "
+                    "name+description, surface existing digest nodes similar "
+                    "enough to either dedup against or link to as related."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -193,35 +223,33 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
                     },
                 ],
             },
-            "daily_create": {
-                "backend": "base",
-                "description": (
-                    "Provision a session note under a daily folder."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "session_id": {"type": "string", "default": ""},
-                        "date": {"type": "string", "default": ""},
-                    },
-                },
-                "steps": [{"backend": "daily_create_step"}],
-            },
             "daily_list": {
                 "backend": "base",
                 "description": "List notes under a single day.",
                 "parameters": {
                     "type": "object",
-                    "properties": {"date": {"type": "string", "default": ""}},
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "YYYY-MM-DD; empty = today",
+                            "default": "",
+                        },
+                    },
                 },
                 "steps": [{"backend": "daily_list_step"}],
             },
             "daily_reindex": {
                 "backend": "base",
-                "description": "Rebuild the day-index page.",
+                "description": "Rebuild the day-index page daily/<date>.md.",
                 "parameters": {
                     "type": "object",
-                    "properties": {"date": {"type": "string", "default": ""}},
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "YYYY-MM-DD; empty = today",
+                            "default": "",
+                        },
+                    },
                 },
                 "steps": [{"backend": "daily_reindex_step"}],
             },
@@ -343,7 +371,10 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
             },
             "write": {
                 "backend": "base",
-                "description": "Write a markdown file.",
+                "description": (
+                    "Write a markdown file (create or overwrite) with "
+                    "name/description frontmatter."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -357,9 +388,54 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
                 },
                 "steps": [{"backend": "write_step"}],
             },
+            "daily_write": {
+                "backend": "base",
+                "description": (
+                    "Write a daily markdown note with conversation source "
+                    "frontmatter."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "daily note filename stem and frontmatter name"
+                            ),
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "frontmatter description",
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "source conversation session "
+                            "identifier",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "body",
+                        },
+                        "metadata": {
+                            "type": "object",
+                            "description": "Optional extra frontmatter "
+                            "fields.",
+                        },
+                    },
+                    "required": [
+                        "name",
+                        "description",
+                        "session_id",
+                        "content",
+                    ],
+                },
+                "steps": [{"backend": "daily_write_step"}],
+            },
             "edit": {
                 "backend": "base",
-                "description": "Find-and-replace in a markdown file.",
+                "description": (
+                    "Find-and-replace in a markdown file (all occurrences)."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -373,12 +449,19 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
             },
             "auto_dream": {
                 "backend": "base",
-                "description": "Auto-dream memory consolidation.",
+                "description": (
+                    "Auto-dream: scan today's day-index and daily notes, "
+                    "globally extract merged units/topics, integrate digest "
+                    "units, write interests.yaml, and persist the dream "
+                    "catalog."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "date": {"type": "string", "default": ""},
                         "hint": {"type": "string", "default": ""},
+                        "scan_days": {"type": "integer", "default": 2},
+                        "max_units": {"type": "integer", "default": 5},
                         "topic_count": {"type": "integer", "default": 3},
                         "topic_diversity_days": {
                             "type": "integer",
@@ -391,6 +474,8 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
                         "backend": "dream_extract_step",
                         "file_catalog": "dream",
                         "topic_session_id": "interests",
+                        "scan_days": 2,
+                        "max_units": 5,
                     },
                     {"backend": "dream_integrate_step"},
                     {
@@ -446,7 +531,22 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
                     "properties": {
                         "changes": {
                             "type": "array",
-                            "items": {"type": "object"},
+                            "description": (
+                                "resource change batch, each item has "
+                                "path/file_path and change"
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "file_path": {"type": "string"},
+                                    "change": {
+                                        "type": "string",
+                                        "description": "added/"
+                                        "modified/deleted",
+                                    },
+                                },
+                            },
                         },
                     },
                     "required": ["changes"],
@@ -456,15 +556,6 @@ def _base_config(enable_search_raw_log: bool = False) -> dict[str, Any]:
         },
         "components": _base_components(),
     }
-
-
-def _index_watch_rules(
-    enable_search_raw_log: bool,
-) -> tuple[list[str], list[str]]:
-    """Return directories/suffixes indexed by ReMe search jobs."""
-    if enable_search_raw_log:
-        return ["daily_dir", "digest_dir", "resource_dir"], ["md", "jsonl"]
-    return ["daily_dir", "digest_dir"], ["md"]
 
 
 def _base_components() -> dict[str, Any]:
@@ -521,6 +612,7 @@ def _base_components() -> dict[str, Any]:
             "default": {
                 "backend": "openai",
                 "model": "",
+                "dimensions": 1024,
                 "credential": {"api_key": "", "base_url": ""},
                 "parameters": {},
             },
@@ -553,21 +645,26 @@ def _apply_embedding_config(
 ) -> None:
     """Map QwenPaw embedding config into ReMe component config."""
     components = cfg["components"]
-    parameters: dict[str, Any] = {}
-    if embedding_config.use_dimensions:
-        parameters["dimensions"] = embedding_config.dimensions
+    if not _is_embedding_enabled(embedding_config):
+        # Keep the explicit empty value: LocalFileStore otherwise defaults to
+        # looking up embedding_store:default even when the component is absent.
+        components["file_store"]["default"]["embedding_store"] = ""
+        components.pop("embedding_store", None)
+        components.pop("as_embedding", None)
+        return
 
     components["as_embedding"]["default"].update(
         {
             "backend": embedding_config.backend,
             "model": embedding_config.model_name,
-            "credential": {
-                "api_key": embedding_config.api_key,
-                "base_url": embedding_config.base_url,
-            },
-            "parameters": parameters,
+            "dimensions": embedding_config.dimensions,
+            "credential": _embedding_credential(embedding_config),
         },
     )
+    if embedding_config.backend == "openai":
+        components["as_embedding"]["default"][
+            "pass_dimensions"
+        ] = embedding_config.use_dimensions
     components["embedding_store"]["default"].update(
         {
             "enable_cache": embedding_config.enable_cache,
@@ -576,6 +673,42 @@ def _apply_embedding_config(
             "max_batch_size": embedding_config.max_batch_size,
         },
     )
+    components["file_store"]["default"]["embedding_store"] = "default"
+
+
+def _is_embedding_enabled(embedding_config: EmbeddingModelConfig) -> bool:
+    """Return whether the configured backend has enough fields to run."""
+    if not embedding_config.model_name.strip():
+        return False
+
+    # Keep enablement aligned with AgentScope credential requirements.
+    backend = embedding_config.backend
+    if backend in _OPENAI_COMPAT_EMBEDDING_BACKENDS:
+        return bool(embedding_config.api_key.strip())
+    if backend == "gemini":
+        return bool(embedding_config.api_key.strip())
+    if backend == "ollama":
+        return True
+    return False
+
+
+def _embedding_credential(
+    embedding_config: EmbeddingModelConfig,
+) -> dict[str, str]:
+    """Build the AgentScope credential payload for the selected backend."""
+    backend = embedding_config.backend
+    if backend in _OPENAI_COMPAT_EMBEDDING_BACKENDS:
+        credential = {"api_key": embedding_config.api_key}
+        if embedding_config.base_url.strip():
+            credential["base_url"] = embedding_config.base_url.strip()
+        return credential
+    if backend == "gemini":
+        return {"api_key": embedding_config.api_key}
+    if backend == "ollama":
+        if embedding_config.base_url.strip():
+            return {"host": embedding_config.base_url.strip()}
+        return {}
+    return {}
 
 
 def get_reme_app_config(

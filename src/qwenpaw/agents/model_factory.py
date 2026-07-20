@@ -9,7 +9,6 @@ Example:
     >>> model, formatter = create_model_and_formatter()
 """
 
-
 import base64
 import logging
 import os
@@ -30,11 +29,14 @@ try:
 except ImportError:
     GeminiChatFormatter = None
 
+from agentscope.formatter import OpenAIResponseFormatter
+
 from .utils.message_request_normalizer import (
     normalize_messages_for_model_request,
 )
 from ..exceptions import ProviderError, ModelFormatterError
 from ..providers import ProviderManager
+from ..providers.capping_formatter import MAX_INLINE_MEDIA_BYTES
 from ..providers.retry_chat_model import (
     RetryChatModel,
     RetryConfig,
@@ -44,14 +46,32 @@ from ..token_usage import TokenRecordingModelWrapper
 
 
 def _file_url_to_path(url: str) -> str:
+    """Convert a file:// URI to a local filesystem path.
+
+    Handles Windows drive letters, UNC authority, and
+    percent-encoded characters.  Non-file:// URLs are
+    returned with only percent-decoding applied.
+
+    Examples:
+        file:///C:/path       -> C:/path
+        file:///tmp/path      -> /tmp/path
+        file://server/share/x -> //server/share/x  (UNC)
     """
-    Strip file:// to path. On Windows file:///C:/path -> C:/path not /C:/path.
-    Percent-decodes the path so non-ASCII filenames resolve correctly.
-    """
-    s = url.removeprefix("file://")
-    # Windows: file:///C:/path yields "/C:/path"; remove leading slash.
+    if not url.startswith("file://"):
+        return unquote(url)
+    s = url[7:]  # strip "file://"
+    # Strip localhost authority: localhost/path -> /path
+    if s.startswith("localhost/"):
+        s = s[9:]  # len("localhost") == 9
+    # Windows drive letter: /C:/path -> C:/path (three-slash form)
     if len(s) >= 3 and s.startswith("/") and s[1].isalpha() and s[2] == ":":
         s = s[1:]
+    # Windows drive letter: C:/path (two-slash form file://C:/...)
+    elif len(s) >= 2 and s[0].isalpha() and s[1] == ":":
+        pass  # already correct
+    elif not s.startswith("/"):
+        # UNC authority form: server/share/x -> //server/share/x
+        s = f"//{s}"
     return unquote(s)
 
 
@@ -94,11 +114,12 @@ def _normalize_messages_for_formatter(
     msgs: list,
     base_formatter_class: Type[FormatterBase],
     formatter_instance: FormatterBase | None = None,
-) -> tuple[list, bool, bool]:
+) -> tuple[list, bool, bool, bool]:
     """Return normalized messages and formatter-family flags.
 
     The returned booleans are
-    ``(is_anthropic_formatter, is_gemini_formatter)``.
+    ``(is_anthropic_formatter, is_gemini_formatter,
+    is_response_formatter)``.
     All formatters receive a copied, normalized message list so
     request-time repair does not mutate stored history.
     """
@@ -107,6 +128,10 @@ def _normalize_messages_for_formatter(
     )
     is_gemini_formatter = GeminiChatFormatter is not None and (
         issubclass(base_formatter_class, GeminiChatFormatter)
+    )
+    is_response_formatter = issubclass(
+        base_formatter_class,
+        OpenAIResponseFormatter,
     )
     supports_multimodal = _supports_multimodal_for_current_model()
     if getattr(formatter_instance, "_qwenpaw_force_strip_media", False):
@@ -125,7 +150,12 @@ def _normalize_messages_for_formatter(
         target_family=target_family,
     )
 
-    return normalized_msgs, is_anthropic_formatter, is_gemini_formatter
+    return (
+        normalized_msgs,
+        is_anthropic_formatter,
+        is_gemini_formatter,
+        is_response_formatter,
+    )
 
 
 def _anthropic_media_dedup_key(source: Any) -> str | None:
@@ -148,6 +178,25 @@ def _anthropic_media_dedup_key(source: Any) -> str | None:
     return None
 
 
+def _video_oversize_placeholder(size: int) -> dict:
+    """Text placeholder substituted for a video that exceeds the inline cap.
+
+    Mirrors the wording used by ``capping_formatter``'s
+    ``CappingFormatterMixin._placeholder_text`` so oversized-video messages
+    are consistent across every provider path.  Tool-result videos inline
+    through these helpers bypass the capping formatters (which only see
+    ``_format_*_source``), so the cap is enforced here instead.
+    """
+    return {
+        "type": "text",
+        "text": (
+            f"[video omitted from model context: local file is "
+            f"{size} bytes, exceeds inline limit of "
+            f"{MAX_INLINE_MEDIA_BYTES} bytes]"
+        ),
+    }
+
+
 def _format_anthropic_video_data_block(block: Any) -> dict | None:
     """Format a 2.0 ``DataBlock`` of video media for Anthropic-compatible APIs.
 
@@ -158,15 +207,20 @@ def _format_anthropic_video_data_block(block: Any) -> dict | None:
     Returns the wire dict, or ``None`` if the source is unusable
     (missing file, unsupported extension, exotic scheme).
     """
+    # pylint: disable=too-many-return-statements
     source = getattr(block, "source", None)
     if source is None:
         return None
 
     media_type = getattr(source, "media_type", None) or ""
 
-    # Base64Source — pass data straight through.
+    # Base64Source — pass data straight through (after the size cap).
     data_attr = getattr(source, "data", None)
     if data_attr is not None:
+        # base64 length -> approximate raw byte count.
+        size = len(data_attr or "") * 3 // 4
+        if size > MAX_INLINE_MEDIA_BYTES:
+            return _video_oversize_placeholder(size)
         return {
             "type": "video",
             "source": {
@@ -182,6 +236,14 @@ def _format_anthropic_video_data_block(block: Any) -> dict | None:
 
     raw_url = _file_url_to_path(url_str)
     if os.path.exists(raw_url) and os.path.isfile(raw_url):
+        # Cap oversized local files before reading/encoding the whole
+        # thing into the request body (see ``capping_formatter``).
+        try:
+            size = os.path.getsize(raw_url)
+        except OSError:
+            size = 0
+        if size > MAX_INLINE_MEDIA_BYTES:
+            return _video_oversize_placeholder(size)
         ext = os.path.splitext(raw_url)[1].lower()
         resolved_media_type = (
             media_type
@@ -231,10 +293,22 @@ def _format_openai_video_block(video_block: dict) -> dict:
     source = video_block["source"]
     if source["type"] == "base64":
         media_type = source["media_type"]
+        # base64 length -> approximate raw byte count.
+        size = len(source.get("data") or "") * 3 // 4
+        if size > MAX_INLINE_MEDIA_BYTES:
+            return _video_oversize_placeholder(size)
         url = f"data:{media_type};base64,{source['data']}"
     elif source["type"] == "url":
         raw_url = _file_url_to_path(source["url"])
         if os.path.exists(raw_url) and os.path.isfile(raw_url):
+            # Cap oversized local files before reading/encoding the whole
+            # thing into the request body (see ``capping_formatter``).
+            try:
+                size = os.path.getsize(raw_url)
+            except OSError:
+                size = 0
+            if size > MAX_INLINE_MEDIA_BYTES:
+                return _video_oversize_placeholder(size)
             ext = os.path.splitext(raw_url)[1].lower()
             media_type = _SUPPORTED_VIDEO_EXTENSIONS.get(ext)
             if not media_type:
@@ -535,30 +609,105 @@ def _fix_image_mime_types(messages: list[dict]) -> None:
     (e.g. ``.jpg`` → ``image/jpg``), but ``image/jpg`` is not a
     valid IANA MIME type — the correct form is ``image/jpeg``.
     Some APIs (Bedrock via litellm) reject the non-standard form.
+
+    Handles both Chat Completions format (``image_url`` is a dict
+    with a ``url`` key) and Responses API format (``image_url`` is
+    a plain string URL).
     """
     for msg in messages:
         content = msg.get("content")
         if not isinstance(content, list):
             continue
         for block in content:
-            url = (block.get("image_url") or {}).get("url", "")
+            if not isinstance(block, dict):
+                continue
+            raw = block.get("image_url")
+            if raw is None:
+                continue
+            if isinstance(raw, dict):
+                url = raw.get("url", "")
+            elif isinstance(raw, str):
+                url = raw
+            else:
+                continue
             for wrong, right in _MIME_FIXES.items():
                 if url.startswith(f"data:{wrong};"):
-                    block["image_url"]["url"] = url.replace(
-                        f"data:{wrong};",
-                        f"data:{right};",
-                        1,
-                    )
+                    fixed = url.replace(f"data:{wrong};", f"data:{right};", 1)
+                    if isinstance(raw, dict):
+                        raw["url"] = fixed
+                    else:
+                        block["image_url"] = fixed
 
 
 _MEDIA_BLOCK_TYPES = ("image", "audio", "video")
 
-# Block types the upstream agentscope OpenAI / Gemini formatters silently
-# drop.  Tracked here so ``aligned_reasoning`` can predict which assistant
-# messages will vanish from the formatted output and stay in sync.  Keep
-# this in lockstep with the ``else: logger.warning("Unsupported block
-# type ...")`` branch in agentscope's ``_openai_formatter``.
-_FORMATTER_SKIPPED_TYPES = frozenset({"thinking", "file"})
+# Block types that the base OpenAI / Gemini formatter processes into
+# ``content_blocks`` or ``tool_calls``, guaranteeing the assistant
+# message survives formatting.
+_SURVIVOR_BLOCK_TYPES = frozenset({"text", "tool_use", "tool_call"})
+
+# Block types the base formatter silently skips.  A message consisting
+# entirely of these (plus any ``DataBlock`` with unsupported media)
+# will be discarded.  Used by ``_is_block_dropped_by_formatter``
+# to predict which assistant messages vanish from the formatted output.
+#
+# ``file`` is kept for completeness but is effectively dead code:
+# ``_fixup_media_list`` converts file blocks to ``TextBlock`` before
+# the prediction runs.
+_ALWAYS_DROPPED_TYPES = frozenset({"thinking", "file", "hint"})
+
+
+def _is_block_dropped_by_formatter(
+    block: Any,
+    formatter: "FormatterBase",
+) -> bool:
+    """Predict whether the base formatter silently skips *block*.
+
+    The base ``OpenAIChatFormatter.format()`` only adds a block to
+    ``content_blocks`` (text, DataBlock with supported media) or
+    ``tool_calls`` (ToolCallBlock).  Everything else — ThinkingBlock,
+    HintBlock, unknown types, and DataBlock with unsupported media — is
+    skipped.  If **all** blocks in an assistant message are skipped, the
+    message itself is discarded (see ``_openai_formatter.py:360``).
+
+    This function returns ``True`` when a block is predicted to be
+    skipped, enabling ``aligned_reasoning`` to correctly predict message
+    drops and stay in sync with the formatted output.  #5858
+    """
+    btype = (
+        block.get("type")
+        if isinstance(block, dict)
+        else getattr(block, "type", None)
+    )
+
+    if btype in _SURVIVOR_BLOCK_TYPES:
+        return False
+
+    if btype in _ALWAYS_DROPPED_TYPES:
+        return True
+
+    if btype == "data":
+        source = getattr(block, "source", None)
+        media_type = (
+            (getattr(source, "media_type", "") or "") if source else ""
+        )
+        supported = getattr(formatter, "supported_input_media_types", [])
+        if not supported:
+            return True
+        from fnmatch import fnmatch
+
+        return not any(fnmatch(media_type, pat) for pat in supported)
+
+    # tool_result produces a separate ``role="tool"`` message but causes
+    # a flush of current content — it does NOT contribute to assistant
+    # ``content_blocks`` itself.  Treat it the same as a dropped block
+    # for assistant-survival prediction (the assistant message is
+    # preserved only if it has other survivor blocks).
+    if btype == "tool_result":
+        return True
+
+    # Unknown block type — the base formatter logs a warning and skips.
+    return True
 
 
 # pylint: disable=too-many-branches
@@ -621,9 +770,7 @@ def _fixup_media_list(items: list) -> None:
             source = getattr(block, "source", None)
             url_str = str(getattr(source, "url", "")) if source else ""
             if url_str.startswith("file://"):
-                local_path = unquote(
-                    url_str.removeprefix("file://"),
-                )
+                local_path = _file_url_to_path(url_str)
                 if not os.path.exists(local_path):
                     mt = getattr(source, "media_type", "") or ""
                     media_name = mt.split("/")[0] or "media"
@@ -639,8 +786,8 @@ def _fixup_media_list(items: list) -> None:
                             f" — file deleted from disk]"
                         ),
                     )
-                elif unquote(url_str) != url_str:
-                    source.url = "file://" + local_path
+                else:
+                    source.url = local_path
         elif btype == "file":
             if isinstance(block, dict):
                 source = block.get("source") or {}
@@ -713,10 +860,14 @@ def _create_file_block_support_formatter(
                 base_formatter_class,
                 AnthropicChatFormatter,
             ):
-                kwargs.setdefault(
-                    "input_types",
-                    ["text/plain", "image/*", "video/*"],
-                )
+                # Direct assignment (not setdefault): kwargs comes from
+                # model_dump() and may carry the base class's narrower
+                # input_types; we must override to include "video/*".
+                kwargs["input_types"] = [
+                    "text/plain",
+                    "image/*",
+                    "video/*",
+                ]
             super().__init__(**kwargs)
 
         def _format_anthropic_data_block(self, block):
@@ -773,6 +924,7 @@ def _create_file_block_support_formatter(
                 normalized_msgs,
                 is_anthropic_formatter,
                 _is_gemini_formatter,
+                _is_response_formatter,
             ) = _normalize_messages_for_formatter(
                 msgs,
                 base_formatter_class,
@@ -843,22 +995,30 @@ def _create_file_block_support_formatter(
                         if ec:
                             tc["extra_content"] = ec
 
-            if reasoning_contents and not is_anthropic_formatter:
+            if (
+                reasoning_contents
+                and not is_anthropic_formatter
+                and not _is_response_formatter
+                and getattr(
+                    self,
+                    "relay_reasoning_content",
+                    True,
+                )
+            ):
                 aligned_reasoning = []
                 for m in (
                     msg for msg in normalized_msgs if msg.role == "assistant"
                 ):
-                    types = (
-                        [_battr(b, "type") for b in m.content]
-                        if isinstance(m.content, list)
-                        else []
+                    blocks = (
+                        list(m.content) if isinstance(m.content, list) else []
                     )
-                    # Drop prediction: a Msg whose blocks are *entirely*
-                    # in the skip set vanishes from formatter output
-                    # (currently {thinking, file}).  See
-                    # ``_FORMATTER_SKIPPED_TYPES``.
-                    is_dropped_by_formatter = bool(types) and all(
-                        t in _FORMATTER_SKIPPED_TYPES for t in types
+                    types = [_battr(b, "type") for b in blocks]
+                    # Drop prediction: a message is discarded when
+                    # *every* block is skipped by the base formatter
+                    # (thinking, hint, file, DataBlock with unsupported
+                    # media, unknown types).  See #5858.
+                    is_dropped_by_formatter = bool(blocks) and all(
+                        _is_block_dropped_by_formatter(b, self) for b in blocks
                     )
                     if is_dropped_by_formatter:
                         continue
@@ -898,7 +1058,8 @@ def _create_file_block_support_formatter(
                         "(%d expected survivors, %d actual). "
                         "Skipping reasoning_content injection for this turn. "
                         "A block type may be dropped by the base formatter "
-                        "without being listed in _FORMATTER_SKIPPED_TYPES, "
+                        "without being handled by "
+                        "_is_block_dropped_by_formatter, "
                         "or a new split pattern needs to be predicted.",
                         len(aligned_reasoning),
                         len(out_assistant),
@@ -995,19 +1156,62 @@ def _create_file_block_support_formatter(
 def _strip_top_level_message_name(
     messages: list[dict],
 ) -> list[dict]:
-    """Strip top-level `name` from OpenAI chat messages.
+    """Strip top-level `name` from OpenAI chat-style messages.
 
     Some strict OpenAI-compatible backends reject `messages[*].name`
     (especially for assistant/tool roles) and may return 500/400 on
-    follow-up turns. Keep function/tool names unchanged.
+    follow-up turns. Responses API also uses top-level non-message items
+    such as ``{"type": "function_call", "name": ...}``, where ``name`` is
+    required; those must be left unchanged.
     """
     for message in messages:
-        message.pop("name", None)
+        if "role" in message:
+            message.pop("name", None)
     return messages
+
+
+def _resolve_model_slot_override(model_slot_override: Any):
+    """Parse an optional per-request model override into a model slot."""
+    from ..config.config import ModelSlotConfig
+
+    slot = None
+    if isinstance(model_slot_override, ModelSlotConfig):
+        slot = model_slot_override
+    if isinstance(model_slot_override, dict):
+        try:
+            slot = ModelSlotConfig.model_validate(model_slot_override)
+        except Exception:
+            logger.warning(
+                "Ignoring invalid model_slot_override dict: %r",
+                model_slot_override,
+            )
+    if isinstance(model_slot_override, str):
+        # Use partition so version-tagged model names can contain ':'.
+        provider_id, sep, model_name = model_slot_override.partition(":")
+        if sep and provider_id.strip() and model_name.strip():
+            slot = ModelSlotConfig(
+                provider_id=provider_id.strip(),
+                model=model_name.strip(),
+            )
+        else:
+            logger.warning(
+                "Ignoring invalid model_slot_override string: %r",
+                model_slot_override,
+            )
+    if model_slot_override is not None and not isinstance(
+        model_slot_override,
+        (ModelSlotConfig, dict, str),
+    ):
+        logger.warning(
+            "Unsupported model_slot_override type: %s",
+            type(model_slot_override).__name__,
+        )
+    return slot
 
 
 def create_model_and_formatter(
     agent_id: Optional[str] = None,
+    model_slot_override: Any = None,
 ) -> Tuple[ChatModelBase, FormatterBase]:
     """Factory method to create model and formatter instances.
 
@@ -1017,6 +1221,12 @@ def create_model_and_formatter(
     Args:
         agent_id: Optional agent ID to load agent-specific model config.
             If None, tries to get from context, then falls back to global.
+        model_slot_override: Optional per-request model override. When
+            provided, it takes precedence over the agent's persisted
+            ``active_model``. Accepts a ``ModelSlotConfig``, a dict matching
+            its schema, or a string of the form ``"<provider_id>:<model>"``.
+            The model name itself may contain ``:`` (e.g. version tags);
+            only the first ``:`` is treated as the separator.
 
     Returns:
         Tuple of (model_instance, formatter_instance)
@@ -1038,6 +1248,7 @@ def create_model_and_formatter(
     model_slot = None
     retry_config = None
     rate_limit_config = None
+    compact_threshold: Optional[float] = None
     if agent_id:
         try:
             agent_config = load_agent_config(agent_id)
@@ -1055,8 +1266,18 @@ def create_model_and_formatter(
                 jitter_range=agent_config.running.llm_rate_limit_jitter,
                 acquire_timeout=agent_config.running.llm_acquire_timeout,
             )
+            # Surface the auto-compaction threshold so the UI can mark where
+            # context starts getting evicted — only when compaction is on.
+            lcc = agent_config.running.light_context_config
+            ccc = lcc.context_compact_config
+            if getattr(ccc, "enabled", False):
+                compact_threshold = ccc.compact_threshold_ratio
         except Exception:
             pass
+
+    slot = _resolve_model_slot_override(model_slot_override)
+    if slot is not None and slot.provider_id and slot.model:
+        model_slot = slot
 
     # Create chat model from agent-specific or global config
     if model_slot and model_slot.provider_id and model_slot.model:
@@ -1100,7 +1321,11 @@ def create_model_and_formatter(
         model.max_retries = 0
 
     # Wrap with retry logic for transient LLM API errors
-    wrapped_model = TokenRecordingModelWrapper(provider_id, model)
+    wrapped_model = TokenRecordingModelWrapper(
+        provider_id,
+        model,
+        compact_threshold=compact_threshold,
+    )
     wrapped_model = RetryChatModel(
         wrapped_model,
         retry_config=retry_config,
@@ -1146,15 +1371,20 @@ def _create_formatter_instance(
     formatter_class = _create_file_block_support_formatter(
         base_formatter_class,
     )
-    kwargs: dict[str, Any] = {}
+    # Carry over all Pydantic field values (max_bytes,
+    # relay_reasoning_content, etc.) from the provider-constructed
+    # formatter so they are not silently reset to defaults.
+    kwargs: dict[str, Any] = base_formatter.model_dump()
     # OpenAI / Gemini wire formats can't carry image bytes inside tool
     # results — promote them into a follow-up user message instead.
     # Anthropic format keeps images in tool_result natively, so no
     # promotion needed.
-    if isinstance(
-        base_formatter,
-        (OpenAIChatFormatter, GeminiChatFormatter),
-    ):
+    _promote_types = (
+        OpenAIChatFormatter,
+        GeminiChatFormatter,
+        OpenAIResponseFormatter,
+    )
+    if isinstance(base_formatter, _promote_types):
         kwargs["promote_tool_result_images"] = True
     return formatter_class(**kwargs)
 

@@ -43,6 +43,9 @@ from ..utils import split_text
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on concurrently-tracked event handlers (flood protection).
+_EVENT_TASK_HARD_CAP = 500
+
 
 class OneBotChannel(BaseChannel):
     """OneBot v11 channel via reverse WebSocket.
@@ -65,6 +68,7 @@ class OneBotChannel(BaseChannel):
         on_reply_sent: OnReplySent = None,
         show_tool_details: bool = True,
         filter_tool_messages: bool = False,
+        no_text_debounce: bool = True,
         filter_thinking: bool = False,
         dm_policy: str = "open",
         group_policy: str = "open",
@@ -80,6 +84,7 @@ class OneBotChannel(BaseChannel):
             on_reply_sent=on_reply_sent,
             show_tool_details=show_tool_details,
             filter_tool_messages=filter_tool_messages,
+            no_text_debounce=no_text_debounce,
             filter_thinking=filter_thinking,
             dm_policy=dm_policy,
             group_policy=group_policy,
@@ -104,6 +109,9 @@ class OneBotChannel(BaseChannel):
 
         # Echo-based API call tracking
         self._pending_calls: Dict[str, asyncio.Future] = {}
+
+        # Fire-and-forget event handlers, tracked so stop() can cancel them.
+        self._event_tasks: Set[asyncio.Task] = set()
 
         # Bot self ID (populated on first meta_event/lifecycle)
         self._self_id: Optional[int] = None
@@ -153,6 +161,7 @@ class OneBotChannel(BaseChannel):
         on_reply_sent: OnReplySent = None,
         show_tool_details: bool = True,
         filter_tool_messages: bool = False,
+        no_text_debounce: bool = True,
         filter_thinking: bool = False,
     ) -> "OneBotChannel":
         return cls(
@@ -165,6 +174,7 @@ class OneBotChannel(BaseChannel):
             on_reply_sent=on_reply_sent,
             show_tool_details=show_tool_details,
             filter_tool_messages=filter_tool_messages,
+            no_text_debounce=no_text_debounce,
             filter_thinking=filter_thinking,
             dm_policy=config.dm_policy,
             group_policy=config.group_policy,
@@ -243,6 +253,12 @@ class OneBotChannel(BaseChannel):
                 pass
             self._watchdog_task = None
         await self._stop_ws_server()
+        # Cancel any in-flight event handlers.
+        for task in list(self._event_tasks):
+            task.cancel()
+        if self._event_tasks:
+            await asyncio.gather(*self._event_tasks, return_exceptions=True)
+            self._event_tasks.clear()
 
     async def _start_ws_server(self) -> None:
         """Create and start the aiohttp WebSocket server.
@@ -418,7 +434,7 @@ class OneBotChannel(BaseChannel):
                         # Dispatch as background task so the WS read
                         # loop stays unblocked — handlers can freely
                         # await _call_api (e.g. resolve file URLs).
-                        asyncio.create_task(self._handle_event(data))
+                        self._spawn_event_task(self._handle_event(data))
                 elif msg.type in (
                     aiohttp.WSMsgType.ERROR,
                     aiohttp.WSMsgType.CLOSE,
@@ -435,6 +451,28 @@ class OneBotChannel(BaseChannel):
     # ------------------------------------------------------------------
     # Event dispatch
     # ------------------------------------------------------------------
+
+    def _spawn_event_task(self, coro) -> None:
+        """Schedule a tracked background event handler with a hard cap.
+
+        Under a message flood the cap prevents unbounded task accumulation;
+        excess events are dropped with a warning. Tracked tasks are cancelled
+        on stop().
+
+        Note: we must not block the WS read loop here — ``_call_api`` awaits
+        echo responses that arrive through the same loop, so a blocking
+        semaphore would deadlock. A drop-on-cap valve is used instead.
+        """
+        if len(self._event_tasks) >= _EVENT_TASK_HARD_CAP:
+            logger.warning(
+                "onebot: event task cap (%d) reached — dropping event",
+                _EVENT_TASK_HARD_CAP,
+            )
+            coro.close()
+            return
+        task = asyncio.create_task(coro)
+        self._event_tasks.add(task)
+        task.add_done_callback(self._event_tasks.discard)
 
     async def _handle_event(self, data: Dict[str, Any]) -> None:
         """Dispatch an OneBot v11 event."""
@@ -672,31 +710,6 @@ class OneBotChannel(BaseChannel):
                 resolved.append(part)
 
         return resolved
-
-    # ------------------------------------------------------------------
-    # Debounce override: process media-only messages immediately
-    # ------------------------------------------------------------------
-
-    def _apply_no_text_debounce(
-        self,
-        session_id: str,
-        content_parts: list,
-    ) -> tuple[bool, list]:
-        """Process media-only messages without waiting for text.
-
-        Same approach as TelegramChannel: if the message contains any
-        media (image, audio, video, file), process it immediately
-        instead of buffering until a text message arrives.
-        """
-        has_media = any(
-            getattr(part, "type", None)
-            not in (ContentType.TEXT, ContentType.REFUSAL)
-            for part in content_parts
-        )
-        if has_media:
-            pending = self._pending_content_by_session.pop(session_id, [])
-            return True, pending + list(content_parts)
-        return super()._apply_no_text_debounce(session_id, content_parts)
 
     # ------------------------------------------------------------------
     # Build AgentRequest

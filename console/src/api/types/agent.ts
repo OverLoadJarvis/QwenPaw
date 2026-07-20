@@ -22,18 +22,28 @@ export interface ToolResultPruningConfig {
   exempt_tool_names: string[];
 }
 
+export type ContextStrategy = "native" | "scroll";
+
+export interface ScrollConfig {
+  db_filename: string;
+  repl_timeout_s: number;
+  history_retention_days: number;
+  allow_unsandboxed: boolean;
+  offload_dialog: boolean;
+}
+
 export interface LightContextConfig {
+  strategy: ContextStrategy;
   dialog_path: string;
   token_count_estimate_divisor: number;
   context_compact_config: ContextCompactConfig;
+  scroll_config: ScrollConfig;
   tool_result_pruning_config: ToolResultPruningConfig;
 }
 
 export interface AutoMemorySearchConfig {
   enabled: boolean;
   max_results: number;
-  min_score: number;
-  persist_to_context: boolean;
 }
 
 export interface EmbeddingModelConfig {
@@ -51,12 +61,12 @@ export interface EmbeddingModelConfig {
 
 export interface ReMeLightMemoryConfig {
   summarize_when_compact: boolean;
-  auto_memory_interval: number | null;
+  inbox_push_enabled: boolean;
+  auto_memory_interval: number;
+  dream_cron_enabled: boolean;
   dream_cron: string;
   auto_memory_search_config: AutoMemorySearchConfig;
   embedding_model_config: EmbeddingModelConfig;
-  rebuild_memory_index_on_start: boolean;
-  enable_search_raw_log: boolean;
 }
 
 export interface AutoTitleConfig {
@@ -65,30 +75,47 @@ export interface AutoTitleConfig {
 }
 
 export interface ADBPGMemoryConfig {
-  host: string;
-  port: number;
-  user: string;
-  password: string;
-  dbname: string;
-  llm_model: string;
-  llm_api_key: string;
-  llm_base_url: string;
-  embedding_model: string;
-  embedding_api_key: string;
-  embedding_base_url: string;
-  embedding_dims: number;
-  api_mode: string;
-  rest_api_key: string;
   rest_base_url: string;
+  rest_api_key: string;
   memory_isolation: boolean;
   search_timeout: number;
-  pool_minconn: number;
-  pool_maxconn: number;
+  auto_memory_search_config: AutoMemorySearchConfig;
+}
+
+export interface DoomLoopStageConfig {
+  after: number;
+  action: string;
+  prompt: string;
+}
+
+export interface DoomLoopConfig {
+  enabled: boolean;
+  window_size: number;
+  similarity_threshold: number;
+  stages: DoomLoopStageConfig[];
+}
+
+export interface IterationGateConfig {
+  enabled: boolean;
+  max_iterations?: number | null;
+}
+
+export interface RubricGateConfig {
+  enabled: boolean;
+  prompt: string;
+  max_interventions: number;
+  in_loop_modes: boolean;
+}
+
+export interface LoopConfig {
+  iteration?: IterationGateConfig;
+  doom_loop: DoomLoopConfig;
+  rubric?: RubricGateConfig;
 }
 
 export interface AgentsRunningConfig {
   max_iters: number;
-  auto_continue_on_text_only: boolean;
+  loop: LoopConfig;
   shell_command_timeout: number;
   shell_command_executable: string;
   llm_retry_enabled: boolean;

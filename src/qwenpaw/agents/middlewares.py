@@ -10,26 +10,33 @@ agentscope's ``MiddlewareBase`` hooks.
 
 Currently provided:
 
-* :class:`ToolResultPruningMiddleware` — tiered truncation of tool-call
-  outputs so oversized results don't exhaust the context budget.
+* :class:`ToolResultPruningMiddleware` — truncation of current and historical
+  tool-call outputs so oversized results don't exhaust the context budget.
 """
 
+import asyncio
 import logging
-import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Set
 
 from agentscope.middleware import MiddlewareBase
+from agentscope.message import Msg
+from agentscope.tool import ToolResponse
 
-from .tools.utils import truncate_text_output, DEFAULT_MAX_BYTES
-from ..constant import TRUNCATION_NOTICE_MARKER
+from .tools.utils import (
+    DEFAULT_MAX_BYTES,
+    ToolResultPruner,
+)
+from ..constant import (
+    EXTERNAL_USER_QUERY_MESSAGE_TAG,
+    QWENPAW_MESSAGE_TAG_KEY,
+)
 
 if TYPE_CHECKING:
     from agentscope.agent import Agent
-    from agentscope.message import Msg
 
 logger = logging.getLogger(__name__)
-MAX_AUTO_MEMORY_REPLY_IDS = 1000
+MAX_AUTO_MEMORY_TURN_MARKERS = 1000
+_AUTOMATION_MEMORY_SKIP_SOURCES = frozenset({"cron", "heartbeat"})
 
 
 class MemoryMiddleware(MiddlewareBase):
@@ -46,9 +53,6 @@ class MemoryMiddleware(MiddlewareBase):
 
     def __init__(self, *, memory_manager: Any) -> None:
         self._memory_manager = memory_manager
-        self._searched_reply_id: str | None = None
-        self._pending_auto_memory_reply_ids: list[str] = []
-        self._seen_auto_memory_reply_ids: dict[str, None] = {}
 
     async def on_system_prompt(
         self,
@@ -69,15 +73,20 @@ class MemoryMiddleware(MiddlewareBase):
         input_kwargs: dict[str, Any],
         next_handler: Callable[..., Any],
     ) -> Any:
-        reply_id = agent.state.reply_id
-        if reply_id != self._searched_reply_id:
-            self._searched_reply_id = reply_id
+        if self._is_automation_request(agent):
+            return await next_handler(**input_kwargs)
+
+        query_msg = self._latest_external_user_query(agent.state.context)
+        turn_marker = query_msg.id if query_msg is not None else ""
+        turn_state = self._auto_memory_turn_state(agent)
+        if turn_marker and turn_marker != turn_state.get("searched_turn"):
+            turn_state["searched_turn"] = turn_marker
             try:
                 result = await self._memory_manager.auto_memory_search(
-                    list(agent.state.context),
+                    query_msg,
                     agent_name=agent.name,
                     session_id=agent.state.session_id,
-                    reply_id=reply_id,
+                    user_turn_id=turn_marker,
                 )
             except Exception:
                 logger.exception(
@@ -92,8 +101,7 @@ class MemoryMiddleware(MiddlewareBase):
                 if memory_msgs:
                     messages.extend(memory_msgs)
                     input_kwargs["messages"] = messages
-                    if self._persist_auto_memory_search_to_context():
-                        agent.state.context.extend(memory_msgs)
+                    agent.state.context.extend(memory_msgs)
         return await next_handler(**input_kwargs)
 
     # pylint: disable=stop-iteration-return
@@ -106,23 +114,33 @@ class MemoryMiddleware(MiddlewareBase):
         async for item in next_handler(**input_kwargs):
             yield item
 
-        reply_id = agent.state.reply_id
-        if not reply_id or reply_id in self._seen_auto_memory_reply_ids:
+        if self._is_automation_request(agent):
             return
-        self._seen_auto_memory_reply_ids[reply_id] = None
-        if len(self._seen_auto_memory_reply_ids) > MAX_AUTO_MEMORY_REPLY_IDS:
-            oldest_key = next(iter(self._seen_auto_memory_reply_ids))
-            self._seen_auto_memory_reply_ids.pop(oldest_key)
-        self._pending_auto_memory_reply_ids.append(reply_id)
+
+        turn_state = self._auto_memory_turn_state(agent)
+        pending_markers = turn_state["pending"]
+        seen_markers = turn_state["seen"]
+        turn_marker = self._latest_user_turn_marker(agent.state.context)
+        if not turn_marker or turn_marker in seen_markers:
+            return
+
+        seen_markers[turn_marker] = None
+        if len(seen_markers) > MAX_AUTO_MEMORY_TURN_MARKERS:
+            oldest_key = next(iter(seen_markers))
+            seen_markers.pop(oldest_key)
+        pending_markers.append(turn_marker)
 
         interval = self._auto_memory_interval()
         if interval <= 0:
-            self._pending_auto_memory_reply_ids.clear()
+            pending_markers.clear()
             return
-        if len(self._pending_auto_memory_reply_ids) < interval:
+        if len(pending_markers) < interval:
             return
 
-        await self._flush_auto_memory(agent, count=interval)
+        await self._flush_auto_memory(
+            agent,
+            count=interval,
+        )
 
     async def on_compress_context(
         self,
@@ -130,10 +148,15 @@ class MemoryMiddleware(MiddlewareBase):
         input_kwargs: dict[str, Any],
         next_handler: Callable[..., Any],
     ) -> None:
+        if self._is_automation_request(agent):
+            await next_handler(**input_kwargs)
+            return
+
         cfg = self._memory_config()
+        pending_markers = self._auto_memory_turn_state(agent)["pending"]
         if (
-            cfg.summarize_when_compact
-            and self._pending_auto_memory_reply_ids
+            getattr(cfg, "summarize_when_compact", False)
+            and pending_markers
             and await self._will_compress_context(agent, input_kwargs)
         ):
             await self._flush_auto_memory(agent)
@@ -146,20 +169,30 @@ class MemoryMiddleware(MiddlewareBase):
         *,
         count: int | None = None,
     ) -> None:
-        if not self._pending_auto_memory_reply_ids:
+        if self._is_automation_request(agent):
+            logger.debug(
+                "MemoryMiddleware auto_memory skipped for automation source: "
+                "agent=%s",
+                agent.name,
+            )
+            # Defensive: clear in case on_reply guard was bypassed
+            self._auto_memory_turn_state(agent)["pending"].clear()
+            return
+
+        pending_markers = self._auto_memory_turn_state(agent)["pending"]
+        if not pending_markers:
             return
 
         if count is None:
-            reply_ids = list(self._pending_auto_memory_reply_ids)
-            self._pending_auto_memory_reply_ids.clear()
+            turn_markers = list(pending_markers)
+            pending_markers.clear()
         else:
-            reply_ids = self._pending_auto_memory_reply_ids[:count]
-            del self._pending_auto_memory_reply_ids[:count]
+            turn_markers = pending_markers[:count]
+            del pending_markers[:count]
 
-        messages = self._messages_for_reply_ids(
+        messages = self._messages_for_user_turns(
             list(agent.state.context),
-            reply_ids=reply_ids,
-            agent_name=agent.name,
+            turn_markers=turn_markers,
         )
         if not messages:
             return
@@ -167,12 +200,29 @@ class MemoryMiddleware(MiddlewareBase):
         try:
             await self._memory_manager.auto_memory(
                 messages,
-                session_id=agent.state.session_id,
-                reply_id=reply_ids[-1],
-                reply_ids=reply_ids,
+                session_id=self._agent_session_id(agent),
             )
         except Exception:
             logger.exception("MemoryMiddleware auto_memory failed")
+
+    @staticmethod
+    def _agent_session_id(agent: "Agent") -> str:
+        session_id = str(getattr(agent.state, "session_id", "") or "")
+        if session_id:
+            return session_id
+        request_context = getattr(agent, "_request_context", None) or {}
+        if isinstance(request_context, dict):
+            return str(request_context.get("session_id") or "")
+        return ""
+
+    @staticmethod
+    def _is_automation_request(agent: "Agent") -> bool:
+        """Return True when the request originates from non-user automation."""
+        request_context = getattr(agent, "_request_context", None) or {}
+        if not isinstance(request_context, dict):
+            return False
+        source = str(request_context.get("source") or "").strip().lower()
+        return source in _AUTOMATION_MEMORY_SKIP_SOURCES
 
     @staticmethod
     async def _will_compress_context(
@@ -210,41 +260,64 @@ class MemoryMiddleware(MiddlewareBase):
         ]
 
     def _auto_memory_interval(self) -> int:
-        interval = self._memory_config().auto_memory_interval
-
-        if interval is None:
-            return 0
-        return int(interval)
+        return int(self._memory_manager.get_auto_memory_interval())
 
     def _memory_config(self) -> Any:
-        from ..config.config import load_agent_config
+        return self._memory_manager.get_memory_config()
 
-        agent_config = load_agent_config(self._memory_manager.agent_id)
-        return agent_config.running.reme_light_memory_config
-
-    def _persist_auto_memory_search_to_context(self) -> bool:
-        search_cfg = self._memory_config().auto_memory_search_config
-        return bool(getattr(search_cfg, "persist_to_context", True))
+    def _auto_memory_turn_state(self, agent: "Agent") -> dict[str, Any]:
+        return self._memory_manager.get_auto_memory_turn_state(
+            self._agent_session_id(agent),
+        )
 
     @staticmethod
-    def _messages_for_reply_ids(
+    def _message_tag(msg: "Msg") -> str:
+        metadata = getattr(msg, "metadata", None)
+        if not isinstance(metadata, dict):
+            return ""
+        return str(metadata.get(QWENPAW_MESSAGE_TAG_KEY) or "")
+
+    @classmethod
+    def _is_external_user_query(cls, msg: "Msg") -> bool:
+        return (
+            msg.role == "user"
+            and cls._message_tag(msg) == EXTERNAL_USER_QUERY_MESSAGE_TAG
+        )
+
+    @classmethod
+    def _latest_external_user_query(
+        cls,
+        messages: list["Msg"],
+    ) -> "Msg | None":
+        for msg in reversed(messages):
+            if cls._is_external_user_query(msg):
+                return msg
+        return None
+
+    @classmethod
+    def _latest_user_turn_marker(cls, messages: list["Msg"]) -> str:
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not cls._is_external_user_query(msg):
+                continue
+            return msg.id
+        return ""
+
+    @classmethod
+    def _messages_for_user_turns(
+        cls,
         messages: list["Msg"],
         *,
-        reply_ids: list[str],
-        agent_name: str,
+        turn_markers: list[str],
     ) -> list["Msg"]:
-        targets = set(reply_ids)
+        targets = set(turn_markers)
         if not targets:
             return []
 
         first_idx: int | None = None
         last_idx: int | None = None
         for idx, msg in enumerate(messages):
-            if (
-                msg.role == "assistant"
-                and msg.name == agent_name
-                and msg.id in targets
-            ):
+            if cls._is_external_user_query(msg) and msg.id in targets:
                 if first_idx is None:
                     first_idx = idx
                 last_idx = idx
@@ -252,22 +325,26 @@ class MemoryMiddleware(MiddlewareBase):
         if first_idx is None or last_idx is None:
             return []
 
-        start_idx = 0
-        for idx in range(first_idx - 1, -1, -1):
-            msg = messages[idx]
-            if msg.role == "assistant" and msg.name == agent_name:
-                start_idx = idx + 1
+        end_idx = len(messages)
+        for idx in range(last_idx + 1, len(messages)):
+            if cls._is_external_user_query(messages[idx]):
+                end_idx = idx
                 break
 
-        return messages[start_idx : last_idx + 1]
+        return [
+            msg
+            for msg in messages[first_idx:end_idx]
+            if msg.role != "user" or cls._is_external_user_query(msg)
+        ]
 
 
 class ToolResultPruningMiddleware(MiddlewareBase):
-    """Truncate oversized tool-call results after each acting step.
+    """Truncate oversized tool-call results around each acting step.
 
-    Implements the ``on_acting`` hook: the inner tool execution runs
-    first, then every ``tool_result`` block in the agent's context is
-    scanned and pruned according to tiered byte thresholds.
+    Implements the ``on_acting`` hook: each ``ToolResponse`` is capped before
+    it is yielded into the agent context, then every historical ``tool_result``
+    block in the agent's context is scanned and pruned according to tiered byte
+    thresholds.
 
     * **Recent** tool results (the last ``recent_n`` tool-bearing messages)
       are capped at ``recent_max_bytes``.
@@ -299,7 +376,7 @@ class ToolResultPruningMiddleware(MiddlewareBase):
         self._recent_max_bytes = recent_max_bytes
         self._exempt_extensions = exempt_file_extensions or set()
         self._exempt_tools = exempt_tool_names or set()
-        self._tool_results_dir = tool_results_dir
+        self._pruner = ToolResultPruner(tool_results_dir)
         self._agent_id = agent_id
 
     async def on_acting(
@@ -310,6 +387,8 @@ class ToolResultPruningMiddleware(MiddlewareBase):
     ) -> AsyncGenerator[Any, None]:
         events: list[Any] = []
         async for event in next_handler():
+            if isinstance(event, ToolResponse):
+                event = await self.prune_tool_response_async(event)
             events.append(event)
             yield event
 
@@ -318,13 +397,40 @@ class ToolResultPruningMiddleware(MiddlewareBase):
 
         try:
             messages = list(agent.state.context)
-            self._prune_tool_results(messages)
+            await asyncio.to_thread(self._prune_tool_results, messages)
         except Exception:
             logger.exception("ToolResultPruningMiddleware failed")
 
     # ------------------------------------------------------------------
     # Core pruning logic (ported from LightContextManager)
     # ------------------------------------------------------------------
+
+    def prune_tool_response(
+        self,
+        response: ToolResponse,
+    ) -> ToolResponse:
+        """Cap the current ToolResponse before it enters agent context."""
+        if not self._enabled:
+            return response
+
+        # Current responses are pruned per text block, not by aggregate
+        # ToolResponse byte size. Multi-block truncation metadata is kept by
+        # content index so one block cannot influence another block's retry
+        # location or cached file path.
+        self._pruner.prune_output(
+            response.content or [],
+            max_bytes=self._recent_max_bytes,
+            metadata=response.metadata,
+        )
+
+        return response
+
+    async def prune_tool_response_async(
+        self,
+        response: ToolResponse,
+    ) -> ToolResponse:
+        """Prune a response without blocking the asyncio event loop."""
+        return await asyncio.to_thread(self.prune_tool_response, response)
 
     def _prune_tool_results(self, messages: list["Msg"]) -> None:
         if not messages:
@@ -333,9 +439,7 @@ class ToolResultPruningMiddleware(MiddlewareBase):
         recent_count = 0
         for msg in reversed(messages):
             if not isinstance(msg.content, list) or not any(
-                (isinstance(b, dict) and b.get("type") == "tool_result")
-                or getattr(b, "type", None) == "tool_result"
-                for b in msg.content
+                self._block_type(b) == "tool_result" for b in msg.content
             ):
                 break
             recent_count += 1
@@ -355,12 +459,7 @@ class ToolResultPruningMiddleware(MiddlewareBase):
             )
 
             for block in msg.content:
-                btype = (
-                    block.get("type")
-                    if isinstance(block, dict)
-                    else getattr(block, "type", None)
-                )
-                if btype != "tool_result":
+                if self._block_type(block) != "tool_result":
                     continue
 
                 tool_id = (
@@ -381,7 +480,16 @@ class ToolResultPruningMiddleware(MiddlewareBase):
                     if tool_id in exempt_tool_ids
                     else max_bytes
                 )
-                pruned = self._prune_output(output, effective_max)
+                block_metadata = (
+                    block.setdefault("metadata", {})
+                    if isinstance(block, dict)
+                    else block.metadata
+                )
+                pruned, _ = self._pruner.prune_output(
+                    output,
+                    max_bytes=effective_max,
+                    metadata=block_metadata,
+                )
                 if isinstance(block, dict):
                     block["output"] = pruned
                 else:
@@ -393,12 +501,7 @@ class ToolResultPruningMiddleware(MiddlewareBase):
             if not isinstance(msg.content, list):
                 continue
             for block in msg.content:
-                btype = (
-                    block.get("type")
-                    if isinstance(block, dict)
-                    else getattr(block, "type", None)
-                )
-                if btype not in ("tool_use", "tool_call"):
+                if self._block_type(block) not in ("tool_use", "tool_call"):
                     continue
 
                 tool_id = (
@@ -438,64 +541,54 @@ class ToolResultPruningMiddleware(MiddlewareBase):
 
         return exempt_ids
 
-    def _prune_output(
+    @staticmethod
+    def _block_type(block: Any) -> str | None:
+        if isinstance(block, dict):
+            return block.get("type")
+        return getattr(block, "type", None)
+
+
+class LangfuseToolSpanMiddleware(MiddlewareBase):
+    """Record each tool execution as a Langfuse tool observation.
+
+    Yields ``None`` from ``tool_span`` when Langfuse is disabled or the
+    client is unavailable; the ``observation is not None`` guard handles
+    this gracefully.
+    """
+
+    async def on_acting(
         self,
-        output: str | list[dict],
-        max_bytes: int,
-        encoding: str = "utf-8",
-    ) -> str | list[dict]:
-        if isinstance(output, str):
-            return self._truncate_tool_result(output, max_bytes, encoding)
-        if isinstance(output, list):
-            for block in output:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    block["text"] = self._truncate_tool_result(
-                        block.get("text", ""),
-                        max_bytes,
-                        encoding,
-                    )
-        return output
+        agent: "Agent",  # pylint: disable=unused-argument
+        input_kwargs: dict[str, Any],
+        next_handler: Callable[..., AsyncGenerator[Any, None]],
+    ) -> AsyncGenerator[Any, None]:
+        from ..observability.langfuse import get_current_trace, tool_span
 
-    def _truncate_tool_result(
-        self,
-        content: str,
-        max_bytes: int,
-        encoding: str = "utf-8",
-    ) -> str:
-        if not content:
-            return content
+        if get_current_trace() is None:
+            async for event in next_handler():
+                yield event
+            return
 
-        if TRUNCATION_NOTICE_MARKER in content:
-            return truncate_text_output(
-                content,
-                max_bytes=max_bytes,
-                encoding=encoding,
-            )
+        tool_call = input_kwargs.get("tool_call")
+        tool_name = getattr(tool_call, "name", "unknown")
+        tool_input = getattr(tool_call, "input", None)
 
-        try:
-            content_bytes = len(content.encode(encoding))
-        except UnicodeEncodeError:
-            return content
-
-        if content_bytes <= max_bytes + 100:
-            return content
-
-        saved_path: str | None = None
-        if self._tool_results_dir:
-            try:
-                tool_result_dir = Path(self._tool_results_dir)
-                tool_result_dir.mkdir(parents=True, exist_ok=True)
-                fp = tool_result_dir / f"{uuid.uuid4().hex}.txt"
-                fp.write_text(content, encoding=encoding)
-                saved_path = str(fp)
-            except OSError as e:
-                logger.warning("Failed to save tool result to file: %s", e)
-
-        return truncate_text_output(
-            content,
-            start_line=1,
-            total_lines=content.count("\n") + 1,
-            max_bytes=max_bytes,
-            file_path=saved_path,
-            encoding=encoding,
-        )
+        async with tool_span(
+            name=tool_name,
+            input=tool_input,
+            metadata={"tool_call_id": getattr(tool_call, "id", None)},
+        ) as observation:
+            final_response = None
+            async for event in next_handler():
+                if isinstance(event, ToolResponse):
+                    final_response = event
+                yield event
+            if observation is not None and final_response is not None:
+                observation.update(
+                    output={
+                        "content": [
+                            getattr(b, "text", str(b))
+                            for b in (final_response.content or [])
+                        ],
+                    },
+                )

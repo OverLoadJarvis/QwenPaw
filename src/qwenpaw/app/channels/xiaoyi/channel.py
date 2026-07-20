@@ -14,6 +14,7 @@ import platform
 import re
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import (
     Any,
@@ -57,6 +58,9 @@ from .constants import (
 from .utils import download_file
 
 logger = logging.getLogger(__name__)
+
+# Upper bound for per-session routing maps to prevent unbounded growth.
+_SESSION_MAP_MAX = 4096
 
 if TYPE_CHECKING:
     from ....schemas import AgentRequest
@@ -361,6 +365,7 @@ class XiaoYiChannel(BaseChannel):
         on_reply_sent: OnReplySent = None,
         show_tool_details: bool = True,
         filter_tool_messages: bool = False,
+        no_text_debounce: bool = True,
         filter_thinking: bool = False,
         bot_prefix: str = "",
         media_dir: str = "",
@@ -373,6 +378,7 @@ class XiaoYiChannel(BaseChannel):
             on_reply_sent=on_reply_sent,
             show_tool_details=show_tool_details,
             filter_tool_messages=filter_tool_messages,
+            no_text_debounce=no_text_debounce,
             filter_thinking=filter_thinking,
             access_control_dm=access_control_dm,
             access_control_group=access_control_group,
@@ -405,11 +411,13 @@ class XiaoYiChannel(BaseChannel):
         self._connected = False
         self._reconnect_attempts = 0
         self._stopping = False  # Flag to prevent reconnect during stop
+        # In-flight reconnect task, tracked so stop() can cancel it.
+        self._reconnect_task: Optional[asyncio.Task] = None
 
-        # Session routing: session_id -> server_name
-        self._session_server_map: Dict[str, str] = {}
-        # Session -> task_id mapping
-        self._session_task_map: Dict[str, str] = {}
+        # Session routing: session_id -> server_name (bounded)
+        self._session_server_map: "OrderedDict[str, str]" = OrderedDict()
+        # Session -> task_id mapping (bounded)
+        self._session_task_map: "OrderedDict[str, str]" = OrderedDict()
 
     @classmethod
     def from_env(
@@ -438,6 +446,7 @@ class XiaoYiChannel(BaseChannel):
         on_reply_sent: OnReplySent = None,
         show_tool_details: bool = True,
         filter_tool_messages: bool = False,
+        no_text_debounce: bool = True,
         filter_thinking: bool = False,
         workspace_dir: Path | None = None,
     ) -> "XiaoYiChannel":
@@ -455,6 +464,7 @@ class XiaoYiChannel(BaseChannel):
                 on_reply_sent=on_reply_sent,
                 show_tool_details=show_tool_details,
                 filter_tool_messages=filter_tool_messages,
+                no_text_debounce=no_text_debounce,
                 filter_thinking=filter_thinking,
                 bot_prefix=config.get("bot_prefix", ""),
                 media_dir=config.get("media_dir", ""),
@@ -477,6 +487,7 @@ class XiaoYiChannel(BaseChannel):
             on_reply_sent=on_reply_sent,
             show_tool_details=show_tool_details,
             filter_tool_messages=filter_tool_messages,
+            no_text_debounce=no_text_debounce,
             filter_thinking=filter_thinking,
             bot_prefix=config.bot_prefix,
             media_dir=getattr(config, "media_dir", ""),
@@ -707,6 +718,19 @@ class XiaoYiChannel(BaseChannel):
                     f"agent_id={self.agent_id}",
                 )
 
+    @staticmethod
+    def _bounded_map_put(
+        store: "OrderedDict[str, str]",
+        key: str,
+        value: str,
+        max_items: int = _SESSION_MAP_MAX,
+    ) -> None:
+        """Set store[key]=value, evicting oldest entries beyond max_items."""
+        store[key] = value
+        store.move_to_end(key)
+        while len(store) > max_items:
+            store.popitem(last=False)
+
     # -----------------------------------------------------------------
     # Message routing (dual connection)
     # -----------------------------------------------------------------
@@ -740,7 +764,11 @@ class XiaoYiChannel(BaseChannel):
                 "sessionId",
             ) or message.get("sessionId")
             if session_id:
-                self._session_server_map[session_id] = server_name
+                self._bounded_map_put(
+                    self._session_server_map,
+                    session_id,
+                    server_name,
+                )
 
             # Handle clear context
             if (
@@ -825,7 +853,11 @@ class XiaoYiChannel(BaseChannel):
                 logger.warning("XiaoYi: No sessionId in message")
                 return
 
-            self._session_task_map[session_id] = task_id
+            self._bounded_map_put(
+                self._session_task_map,
+                session_id,
+                task_id or "",
+            )
 
             # Extract content parts
             text_parts: List[str] = []
@@ -1032,7 +1064,7 @@ class XiaoYiChannel(BaseChannel):
                 logger.error(f"XiaoYi: Reconnect failed: {e}")
                 self._schedule_reconnect()
 
-        asyncio.create_task(reconnect())
+        self._reconnect_task = asyncio.create_task(reconnect())
 
     async def stop(self) -> None:
         """Stop WebSocket connections."""
@@ -1040,6 +1072,15 @@ class XiaoYiChannel(BaseChannel):
 
         self._stopping = True  # Prevent reconnect during stop
         self._connected = False
+
+        # Cancel any in-flight reconnect task.
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+        self._reconnect_task = None
 
         # Disconnect both connections
         for conn in (self._conn_primary, self._conn_backup):

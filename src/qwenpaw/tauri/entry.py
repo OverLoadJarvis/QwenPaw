@@ -283,6 +283,12 @@ def _run_backend_server(log_level: str) -> None:
     os.environ[LOG_LEVEL_ENV] = normalized_log_level
     os.environ.pop("QWENPAW_RELOAD_MODE", None)
     setup_logger(normalized_log_level)
+
+    # Ensure only one desktop backend runs: terminate any orphan left by a
+    # crashed/force-quit previous launch before we bind a new port (#5550).
+    from qwenpaw.tauri.backend_guard import reconcile_singleton_backend
+
+    reconcile_singleton_backend(WORKING_DIR)
     if normalized_log_level in ("debug", "trace"):
         from qwenpaw.cli.main import log_init_timings
 
@@ -352,6 +358,13 @@ def main() -> None:
             args=["--defaults", "--accept-security"],
             label="initialization",
         )
+
+    # On Windows, auto-disable sandbox when not running as admin so the
+    # desktop backend starts without a half-broken sandbox layer (mirrors
+    # the same guard in cli/app_cmd.py for `qwenpaw app`).
+    from qwenpaw.utils.platform import auto_disable_sandbox_on_windows
+
+    auto_disable_sandbox_on_windows()
 
     _run_backend_server(os.environ.get(LOG_LEVEL_ENV, "info"))
 

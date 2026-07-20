@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 import uuid
 from contextlib import AsyncExitStack
 from typing import Any, AsyncIterator, cast
@@ -35,11 +36,17 @@ from acp.schema import (
     RequestPermissionResponse,
 )
 
+from ....agents.acp.meta import (
+    ACP_APPROVAL_EXPIRES_AT_META_KEY,
+    ACP_CODING_PROJECT_META_KEY,
+    ACP_EPHEMERAL_META_KEY,
+)
 from ..__version__ import __version__
 from ..events import (
     BackendWarmed,
     Connected,
     PermissionOption,
+    PermissionExpired,
     PermissionRequest,
     PushMessage,
     SessionSummary,
@@ -47,7 +54,7 @@ from ..events import (
     TurnEnded,
     TuiEvent,
 )
-from ..normalize import normalize_update
+from ..normalize import normalize_update, tool_input_text
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +75,8 @@ _WARMUP_PROMPT = (
 # ``_meta`` flag marking the warmup session ephemeral so the QwenPaw ACP server
 # never registers a console chat or persists state for it. Passed as an extra
 # kwarg on ``new_session``/``prompt`` (the ACP client folds extra kwargs into
-# the request's ``_meta``). Mirrors the server's ``ACP_EPHEMERAL_META_KEY``.
-_EPHEMERAL_META_KEY = "qwenpaw.ephemeral"
+# the request's ``_meta``).
+_EPHEMERAL_META_KEY = ACP_EPHEMERAL_META_KEY
 
 
 def _open_agent_stderr_log() -> tuple[int | None, str | None]:
@@ -122,6 +129,69 @@ def _kill_process_tree(pid: int) -> None:
         parent.kill()
     except Exception:
         pass
+
+
+def _permission_params(tool_call: Any) -> str | None:
+    """Render ACP permission tool parameters for the inline approval prompt.
+
+    Same rendering as the tool panel (``tool_input_text``), so what the user
+    approves is exactly what the panel then shows.
+    """
+    return tool_input_text(_tool_call_raw_input(tool_call)) or None
+
+
+def _permission_expires_at(tool_call: Any) -> float | None:
+    meta = _tool_call_meta(tool_call)
+    value = meta.get(ACP_APPROVAL_EXPIRES_AT_META_KEY)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+_PERMISSION_TIMEOUT_MESSAGE = (
+    "Approval request timed out. The tool call was blocked; "
+    "start a new request to try again."
+)
+
+# Extra slack past the advertised deadline before the TUI expires a prompt
+# locally, so the server (which shares the same clock and blocks the tool at
+# exactly the deadline) always times out first and a last-second approval is
+# never dropped on the client side.
+_PERMISSION_EXPIRY_GRACE_SECONDS = 1.0
+
+
+def _permission_expired_message(exc: asyncio.CancelledError) -> str:
+    reason = str(exc.args[0]) if exc.args else ""
+    if reason == "timeout":
+        return _PERMISSION_TIMEOUT_MESSAGE
+    return (
+        "Approval request is no longer pending; it was resolved or "
+        "cancelled elsewhere."
+    )
+
+
+def _tool_call_meta(tool_call: Any) -> dict[str, Any]:
+    if isinstance(tool_call, dict):
+        meta = tool_call.get("_meta") or tool_call.get("field_meta")
+    else:
+        meta = getattr(tool_call, "field_meta", None)
+        if meta is None:
+            meta = getattr(tool_call, "_meta", None)
+    return meta if isinstance(meta, dict) else {}
+
+
+def _tool_call_raw_input(tool_call: Any) -> Any:
+    if isinstance(tool_call, dict):
+        return tool_call.get("rawInput", tool_call.get("raw_input"))
+    raw_input = getattr(tool_call, "raw_input", None)
+    if raw_input is not None:
+        return raw_input
+    return getattr(tool_call, "rawInput", None)
 
 
 class _TuiClient:
@@ -183,11 +253,14 @@ class _TuiClient:
             or getattr(tool_call, "tool_call_id", None)
             or "Permission required"
         )
+        expires_at = _permission_expires_at(tool_call)
         await self._queue.put(
             PermissionRequest(
                 request_id=request_id,
                 title=str(title),
                 tool_kind=getattr(tool_call, "kind", None),
+                params=_permission_params(tool_call),
+                expires_at=expires_at,
                 options=[
                     PermissionOption(
                         option_id=getattr(o, "option_id", ""),
@@ -200,8 +273,38 @@ class _TuiClient:
             ),
         )
 
+        # ACP has no agent→client request cancellation, so a server-side
+        # timeout never reaches this handler — enforce the advertised
+        # deadline locally (with grace, so the server always expires first).
+        timeout = None
+        if expires_at is not None:
+            timeout = max(
+                expires_at + _PERMISSION_EXPIRY_GRACE_SECONDS - time.time(),
+                0.0,
+            )
+
         try:
-            option_id = await future
+            option_id = await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            await self._queue.put(
+                PermissionExpired(
+                    request_id=request_id,
+                    message=_PERMISSION_TIMEOUT_MESSAGE,
+                ),
+            )
+            return RequestPermissionResponse(
+                outcome=DeniedOutcome(outcome="cancelled"),
+            )
+        except asyncio.CancelledError as exc:
+            if not future.done():
+                future.cancel()
+            await self._queue.put(
+                PermissionExpired(
+                    request_id=request_id,
+                    message=_permission_expired_message(exc),
+                ),
+            )
+            raise
         finally:
             self._pending.pop(request_id, None)
 
@@ -255,20 +358,28 @@ class AcpTransport:
         agent: str | None = None,
         cwd: str | None = None,
         command: list[str] | None = None,
+        project_dir: str | None = None,
         resume_session_id: str | None = None,
     ) -> None:
         self._agent = agent
         self._cwd = cwd or os.getcwd()
+        self._project_dir = project_dir
         # When set, ``start()`` resumes this session (load + replay) instead
         # of opening a fresh one.
         self._resume_session_id = resume_session_id
         # Default: re-invoke this very interpreter as `python -m qwenpaw acp`.
-        # Copy the caller's list so appending ``--agent`` never mutates it.
-        self._command = (
-            list(command)
-            if command
-            else [sys.executable, "-m", "qwenpaw", "acp"]
-        )
+        # The TUI owns that subprocess, so opt it into local diagnostics.
+        # Copy the caller's list so appending options never mutates it.
+        if command is None:
+            self._command = [
+                sys.executable,
+                "-m",
+                "qwenpaw",
+                "acp",
+                "--local-diagnostics",
+            ]
+        else:
+            self._command = list(command)
         if agent:
             self._command += ["--agent", agent]
 
@@ -287,6 +398,11 @@ class AcpTransport:
     @property
     def session_id(self) -> str | None:
         return self._session_id
+
+    def _session_kwargs(self) -> dict[str, str]:
+        if not self._project_dir:
+            return {}
+        return {ACP_CODING_PROJECT_META_KEY: self._project_dir}
 
     async def start(self) -> Connected:
         self._stack = AsyncExitStack()
@@ -323,12 +439,16 @@ class AcpTransport:
             session = await self._conn.load_session(
                 cwd=self._cwd,
                 session_id=session_id,
+                **self._session_kwargs(),
             )
             # LoadSessionResponse carries no model list; it populates from the
             # first turn's usage report instead.
             model = None
         else:
-            session = await self._conn.new_session(cwd=self._cwd)
+            session = await self._conn.new_session(
+                cwd=self._cwd,
+                **self._session_kwargs(),
+            )
             session_id = cast(str, session.session_id)
             model = _current_model(session)
         self._session_id = session_id
@@ -498,7 +618,11 @@ class AcpTransport:
         # replayed history updates (tagged with this id) aren't filtered out.
         self._session_id = session_id
         self._client.set_session_id(session_id)
-        await self._conn.load_session(cwd=self._cwd, session_id=session_id)
+        await self._conn.load_session(
+            cwd=self._cwd,
+            session_id=session_id,
+            **self._session_kwargs(),
+        )
 
     async def resolve_permission(
         self,
